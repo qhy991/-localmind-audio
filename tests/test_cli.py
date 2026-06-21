@@ -148,3 +148,90 @@ def test_transcribe_cancelled_emits_cancelled_error(tmp_path, monkeypatch):
     assert rc == 130
     data = json.loads(out)
     assert data["error"]["code"] == "cancelled"
+
+
+# --------------------------------------------------------------------------- #
+# benchmark: decode timing includes source construction                       #
+# --------------------------------------------------------------------------- #
+
+def test_benchmark_decode_timing_includes_source_construction(tmp_path, monkeypatch):
+    """The decode stage must include source setup (open/probe), so a measurable
+    delay injected into source construction shows up in the reported decode time."""
+    import time as _time
+    import localmind.cli as cli_mod
+
+    real_open = cli_mod.audio_source_from_path
+
+    def slow_open(path, target_sample_rate=16000):
+        _time.sleep(0.1)
+        return real_open(path, target_sample_rate)
+
+    monkeypatch.setattr(cli_mod, "audio_source_from_path", slow_open)
+    wav = _wav(tmp_path)
+    rc, out, _ = _run(
+        ["benchmark", str(wav), "--mock", "--model-dir", str(tmp_path / "models"),
+         "--chunk-sec", "1", "--overlap-sec", "0.1"],
+        tmp_path,
+    )
+    assert rc == 0
+    report = json.loads(out)
+    stages = {s["stage"]: s["duration_sec"] for s in report["stages"]}
+    assert stages["decode"] >= 0.1  # the injected source-construction delay
+
+
+# --------------------------------------------------------------------------- #
+# summarize + analyze (structured-summary via CLI)                            #
+# --------------------------------------------------------------------------- #
+
+def _transcript_json(tmp_path, segments):
+    p = tmp_path / "transcript.json"
+    p.write_text(json.dumps({"segments": segments}))
+    return p
+
+
+def test_summarize_mock_emits_versioned_summary(tmp_path):
+    from localmind.summary import SUMMARY_SCHEMA_VERSION
+    segs = [{"id": "seg-0000", "start": 0.0, "end": 1.0, "text": "hello"},
+            {"id": "seg-0001", "start": 1.0, "end": 2.0, "text": "world"}]
+    tjson = _transcript_json(tmp_path, segs)
+    rc, out, _ = _run(["summarize", str(tjson), "--mock"], tmp_path)
+    assert rc == 0
+    summary = json.loads(out)
+    assert summary["schema_version"] == SUMMARY_SCHEMA_VERSION
+    assert summary["case_id"] == "transcript"
+    assert isinstance(summary["decisions"], list) and len(summary["decisions"]) >= 1
+    # Citations reference real segment ids.
+    cited = summary["decisions"][0]["citations"][0]
+    assert cited.endswith("seg-0000") or cited.endswith("seg-0001")
+
+
+def test_analyze_mock_emits_combined_json(tmp_path):
+    from localmind.summary import SUMMARY_SCHEMA_VERSION
+    wav = _wav(tmp_path)
+    rc, out, err = _run(
+        ["analyze", str(wav), "--mock", "--model-dir", str(tmp_path / "models"),
+         "--chunk-sec", "1", "--overlap-sec", "0.1"],
+        tmp_path,
+    )
+    assert rc == 0
+    data = json.loads(out)
+    assert data["schema_version"] == CLI_OUTPUT_SCHEMA_VERSION
+    assert data["command"] == "analyze"
+    assert len(data["transcript"]["segments"]) >= 1
+    assert data["summary"]["schema_version"] == SUMMARY_SCHEMA_VERSION
+    # Progress covers both stages.
+    stages_seen = {json.loads(ln)["stage"] for ln in err.strip().split("\n") if ln}
+    assert "stt" in stages_seen and "summarize" in stages_seen
+
+
+def test_summarize_rejects_missing_transcript(tmp_path):
+    rc, out, _ = _run(["summarize", str(tmp_path / "nope.json"), "--mock"], tmp_path)
+    assert rc == 1
+    data = json.loads(out)
+    assert data["error"]["code"] == "cli_error"
+
+
+def test_cli_summary_schema_version_pinned():
+    from localmind.summary import SUMMARY_SCHEMA_VERSION
+    assert SUMMARY_SCHEMA_VERSION == "soundmind.summary.v1"
+

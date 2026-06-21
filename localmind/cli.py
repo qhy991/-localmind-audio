@@ -45,7 +45,9 @@ from localmind.stt import (
     WhisperTranscriber,
     audio_source_from_path,
 )
+from localmind.stt.segment import TranscriptSegment
 from localmind.stt.transcriber import Transcriber
+from localmind.summary import MockSummaryLLM, Summarizer, SummaryLLM
 
 # Bumping this is a breaking change caught by the contract tests.
 CLI_OUTPUT_SCHEMA_VERSION = "1"
@@ -147,11 +149,6 @@ def _peak_memory() -> List[PeakMemory]:
 
 
 def cmd_benchmark(args, out: IO, err: IO) -> int:
-    try:
-        source = audio_source_from_path(args.audio, target_sample_rate=16000)
-    except (AudioError, OSError) as exc:
-        raise CliError(f"cannot open audio source {args.audio}: {exc}") from exc
-
     config = ChunkingConfig(
         chunk_duration_sec=args.chunk_sec, overlap_sec=args.overlap_sec
     )
@@ -159,9 +156,14 @@ def cmd_benchmark(args, out: IO, err: IO) -> int:
     provisioner = None if args.mock else Provisioner(args.model_dir)
     tier = "mock" if args.mock else args.tier
 
+    # The decode stage owns source setup: container open, header parse, and
+    # (for compressed sources) ffmpeg duration probing. Per-window reads happen
+    # later inside the transcriber and are accounted to the stt stage.
     t_decode_start = time.perf_counter()
-    # Source construction already happened above (probes duration / opens the
-    # file); account that as the decode stage.
+    try:
+        source = audio_source_from_path(args.audio, target_sample_rate=16000)
+    except (AudioError, OSError) as exc:
+        raise CliError(f"cannot open audio source {args.audio}: {exc}") from exc
     decode_sec = time.perf_counter() - t_decode_start
 
     def on_progress(fraction: float) -> None:
@@ -208,6 +210,102 @@ def cmd_benchmark(args, out: IO, err: IO) -> int:
     return 0
 
 
+def _select_summary_llm(args) -> SummaryLLM:
+    if args.mock:
+        return MockSummaryLLM()
+    # The real LLM backend (mlx-lm / llama.cpp) adapter is pending; require --mock.
+    raise CliError(
+        "the real LLM backend is not wired yet; pass --mock for an offline "
+        "contract run (see docs/provisioning.md)"
+    )
+
+
+def _load_segments(transcript_path) -> List[TranscriptSegment]:
+    try:
+        data = json.loads(Path(transcript_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CliError(f"cannot read transcript {transcript_path}: {exc}") from exc
+    if isinstance(data, dict):
+        segs = data.get("segments", [])
+    elif isinstance(data, list):
+        segs = data
+    else:
+        raise CliError("transcript must be a JSON object with 'segments' or a JSON array")
+    if not isinstance(segs, list) or not segs:
+        raise CliError("transcript has no segments")
+    segments = []
+    for i, s in enumerate(segs):
+        if not isinstance(s, dict) or "text" not in s:
+            raise CliError(f"transcript segment {i} is malformed")
+        segments.append(TranscriptSegment(
+            id=str(s.get("id") or f"seg-{i:04d}"),
+            start=float(s.get("start", 0.0)),
+            end=float(s.get("end", 0.0)),
+            text=str(s.get("text", "")),
+        ))
+    return segments
+
+
+def cmd_summarize(args, out: IO, err: IO) -> int:
+    segments = _load_segments(args.transcript)
+    llm = _select_summary_llm(args)
+    summarizer = Summarizer(llm, model_id="mock-llm" if args.mock else args.llm_tier)
+    case_id = Path(args.transcript).stem
+
+    if not args.no_progress:
+        _emit_progress(err, {"stage": "summarize", "fraction": 0.0})
+    summary = summarizer.summarize(segments, case_id=case_id)
+    if not args.no_progress:
+        _emit_progress(err, {"stage": "summarize", "fraction": 1.0})
+
+    _emit_json(out, summary)
+    return 0
+
+
+def cmd_analyze(args, out: IO, err: IO) -> int:
+    # Stage 1: transcribe.
+    try:
+        source = audio_source_from_path(args.audio, target_sample_rate=16000)
+    except (AudioError, OSError) as exc:
+        raise CliError(f"cannot open audio source {args.audio}: {exc}") from exc
+
+    config = ChunkingConfig(chunk_duration_sec=args.chunk_sec, overlap_sec=args.overlap_sec)
+    transcriber = _select_transcriber(args)
+    provisioner = None if args.mock else Provisioner(args.model_dir)
+    stt_tier = "mock" if args.mock else args.tier
+
+    def on_stt(fraction: float) -> None:
+        if not args.no_progress:
+            _emit_progress(err, {"stage": "stt", "fraction": round(float(fraction), 4)})
+
+    segments = transcriber.transcribe(source, config, provisioner, stt_tier, on_stt)
+    stt_provenance = getattr(transcriber, "last_provenance", None)
+
+    # Stage 2: summarize.
+    llm = _select_summary_llm(args)
+    summarizer = Summarizer(llm, model_id="mock-llm" if args.mock else args.llm_tier)
+    if not args.no_progress:
+        _emit_progress(err, {"stage": "summarize", "fraction": 0.0})
+    summary = summarizer.summarize(segments, case_id=Path(args.audio).stem)
+    if not args.no_progress:
+        _emit_progress(err, {"stage": "summarize", "fraction": 1.0})
+
+    result = {
+        "schema_version": CLI_OUTPUT_SCHEMA_VERSION,
+        "command": "analyze",
+        "audio": {"path": str(Path(args.audio)), "duration_sec": source.duration_sec},
+        "stt_tier": stt_tier,
+        "mock": bool(args.mock),
+        "transcript": {
+            "segments": [_segment_to_dict(s) for s in segments],
+            "provenance": _provenance_to_dict(stt_provenance),
+        },
+        "summary": summary,
+    }
+    _emit_json(out, result)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="localmind", description="LocalMind Audio CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -229,6 +327,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench = sub.add_parser("benchmark", help="run transcribe with per-stage timing")
     add_common(p_bench)
     p_bench.set_defaults(func=cmd_benchmark)
+
+    p_summarize = sub.add_parser("summarize", help="summarize a transcript JSON")
+    p_summarize.add_argument("transcript", help="path to a transcript JSON (transcribe output)")
+    p_summarize.add_argument("--mock", action="store_true", help="use MockSummaryLLM (no LLM backend)")
+    p_summarize.add_argument("--llm-tier", default="qwen2.5-7b", help="LLM model id (real backend)")
+    p_summarize.add_argument("--no-progress", action="store_true", help="suppress JSONL progress events")
+    p_summarize.set_defaults(func=cmd_summarize)
+
+    p_analyze = sub.add_parser("analyze", help="transcribe + summarize in one pass")
+    add_common(p_analyze)
+    p_analyze.add_argument("--llm-tier", default="qwen2.5-7b", help="LLM model id (real backend)")
+    p_analyze.set_defaults(func=cmd_analyze)
 
     return parser
 
