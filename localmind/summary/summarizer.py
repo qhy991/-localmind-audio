@@ -190,6 +190,7 @@ class Summarizer:
 
     def summarize(self, segments: List[TranscriptSegment], case_id: str) -> Dict:
         self._repaired = False
+        self._repair_attempted = False
         self._repair_used = 0
         self._initial_errors: List[str] = []
 
@@ -221,6 +222,7 @@ class Summarizer:
                 "model_id": self.model_id,
                 "prompt_template_hash": self.prompt_template_hash,
                 "repaired": self._repaired,
+                "repair_attempted": self._repair_attempted,
                 "repair_attempts_used": self._repair_used,
                 "initial_validation_errors": list(self._initial_errors),
             },
@@ -242,7 +244,9 @@ class Summarizer:
 
         Returns (parsed_or_None, last_raw_output, errors). On success errors is
         empty; on exhaustion parsed is None and errors is non-empty. Repair
-        metadata is recorded on the summarizer.
+        metadata is recorded on the summarizer. ``repaired`` is reserved for a
+        repair that produced a valid output; a failed repair records
+        ``repair_attempted`` only.
         """
         raw = self.llm.generate(prompt)
         parsed, errors = _parse_and_validate_sections(raw, segments)
@@ -261,15 +265,17 @@ class Summarizer:
             attempts_used += 1
             parsed, errors = _parse_and_validate_sections(raw, segments)
             if parsed is not None:
-                self._record_repair(initial_errors, attempts_used)
+                self._record_repair(initial_errors, attempts_used, succeeded=True)
                 return parsed, raw, []
 
-        self._record_repair(initial_errors, attempts_used or self.max_repair_attempts)
+        self._record_repair(initial_errors, attempts_used or self.max_repair_attempts, succeeded=False)
         return None, raw, errors or ["repair exhausted"]
 
-    def _record_repair(self, initial_errors: List[str], attempts: int) -> None:
-        self._repaired = True
+    def _record_repair(self, initial_errors: List[str], attempts: int, *, succeeded: bool) -> None:
+        self._repair_attempted = True
         self._repair_used += attempts
+        if succeeded:
+            self._repaired = True
         if not self._initial_errors:
             self._initial_errors = list(initial_errors)
 
@@ -278,6 +284,6 @@ class Summarizer:
             raw, errors, case_id=case_id,
             model_id=self.model_id,
             prompt_template_hash=self.prompt_template_hash,
-            repaired=self._repaired,
+            repair_attempted=self._repair_attempted,
             repair_attempts_used=self._repair_used,
         )

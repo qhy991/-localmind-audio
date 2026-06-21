@@ -183,10 +183,14 @@ def build_summary_failed(
     case_id: Optional[str] = None,
     model_id: str = "",
     prompt_template_hash: str = "",
-    repaired: bool = False,
+    repair_attempted: bool = False,
     repair_attempts_used: int = 0,
 ) -> Dict:
-    """Construct a ``summary_failed`` artifact (raw output + errors, no fabrication)."""
+    """Construct a ``summary_failed`` artifact (raw output + errors, no fabrication).
+
+    A failed artifact is never ``repaired`` (repair did not produce a valid
+    summary); ``repair_attempted`` records whether a repair was tried.
+    """
     error_list = [str(e) for e in errors]
     if not error_list:
         error_list = ["unknown validation error"]
@@ -199,7 +203,8 @@ def build_summary_failed(
         "provenance": {
             "model_id": model_id,
             "prompt_template_hash": prompt_template_hash,
-            "repaired": repaired,
+            "repaired": False,
+            "repair_attempted": repair_attempted,
             "repair_attempts_used": repair_attempts_used,
         },
     }

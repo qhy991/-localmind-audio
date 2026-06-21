@@ -184,6 +184,7 @@ def test_summarizer_repair_recorded_in_provenance():
     validate_summary_against_transcript(summary, segs)
     prov = summary["provenance"]
     assert prov["repaired"] is True
+    assert prov["repair_attempted"] is True
     assert prov["repair_attempts_used"] == 1
     assert len(prov["initial_validation_errors"]) >= 1
 
@@ -197,6 +198,11 @@ def test_summarizer_repair_exhausted_returns_summary_failed():
     assert summary["status"] == "failed"
     assert isinstance(summary["raw_output"], str) and summary["raw_output"]
     assert len(summary["errors"]) >= 1
+    # Exhausted repair is NOT repaired; it was attempted.
+    prov = summary["provenance"]
+    assert prov["repaired"] is False
+    assert prov["repair_attempted"] is True
+    assert prov["repair_attempts_used"] == 1
     # 1 initial map call + 1 map repair; reduce never reached.
     assert llm.map_calls == 2
     assert llm.reduce_calls == 0

@@ -235,3 +235,114 @@ def test_cli_summary_schema_version_pinned():
     from localmind.summary import SUMMARY_SCHEMA_VERSION
     assert SUMMARY_SCHEMA_VERSION == "soundmind.summary.v1"
 
+
+# --------------------------------------------------------------------------- #
+# CLI repair / failure contract (structured-summary via CLI)                  #
+# --------------------------------------------------------------------------- #
+
+def _patch_llm(monkeypatch, mode):
+    from localmind.summary import MockSummaryLLM
+    import localmind.cli as cli_mod
+    monkeypatch.setattr(cli_mod, "_select_summary_llm", lambda args: MockSummaryLLM(mode))
+
+
+def test_summarize_repair_contract(tmp_path, monkeypatch):
+    _patch_llm(monkeypatch, "invalid_then_valid")
+    segs = [{"id": "seg-0000", "start": 0.0, "end": 1.0, "text": "hello"},
+            {"id": "seg-0001", "start": 1.0, "end": 2.0, "text": "world"}]
+    tjson = _transcript_json(tmp_path, segs)
+    rc, out, _ = _run(["summarize", str(tjson), "--mock"], tmp_path)
+    assert rc == 0
+    summary = json.loads(out)
+    assert summary["schema_version"] == "soundmind.summary.v1"
+    prov = summary["provenance"]
+    assert prov["repaired"] is True
+    assert prov["repair_attempts_used"] == 1
+    assert len(prov["initial_validation_errors"]) >= 1
+
+
+def test_summarize_failure_contract(tmp_path, monkeypatch):
+    _patch_llm(monkeypatch, "always_invalid")
+    segs = [{"id": "seg-0000", "start": 0.0, "end": 1.0, "text": "hello"}]
+    tjson = _transcript_json(tmp_path, segs)
+    rc, out, _ = _run(["summarize", str(tjson), "--mock"], tmp_path)
+    assert rc == 0
+    failed = json.loads(out)
+    assert failed["status"] == "failed"
+    assert isinstance(failed["raw_output"], str) and failed["raw_output"]
+    assert len(failed["errors"]) >= 1
+    assert failed["provenance"]["repaired"] is False
+
+
+def test_analyze_repair_contract(tmp_path, monkeypatch):
+    _patch_llm(monkeypatch, "invalid_then_valid")
+    wav = _wav(tmp_path)
+    rc, out, _ = _run(
+        ["analyze", str(wav), "--mock", "--model-dir", str(tmp_path / "models"),
+         "--chunk-sec", "1", "--overlap-sec", "0.1"],
+        tmp_path,
+    )
+    assert rc == 0
+    data = json.loads(out)
+    prov = data["summary"]["provenance"]
+    assert prov["repaired"] is True
+    assert prov["repair_attempts_used"] == 1
+
+
+def test_analyze_failure_contract(tmp_path, monkeypatch):
+    _patch_llm(monkeypatch, "always_invalid")
+    wav = _wav(tmp_path)
+    rc, out, _ = _run(
+        ["analyze", str(wav), "--mock", "--model-dir", str(tmp_path / "models"),
+         "--chunk-sec", "1", "--overlap-sec", "0.1"],
+        tmp_path,
+    )
+    assert rc == 0
+    data = json.loads(out)
+    assert data["summary"]["status"] == "failed"
+    assert data["summary"]["provenance"]["repaired"] is False
+    assert len(data["summary"]["errors"]) >= 1
+
+
+def test_analyze_persists_to_store(tmp_path):
+    wav = _wav(tmp_path)
+    db = tmp_path / "s.db"
+    rc, out, _ = _run(
+        ["analyze", str(wav), "--mock", "--store", str(db),
+         "--model-dir", str(tmp_path / "models"), "--chunk-sec", "1", "--overlap-sec", "0.1"],
+        tmp_path,
+    )
+    assert rc == 0
+    data = json.loads(out)
+    run_id = data["store_run_id"]
+    assert run_id
+
+    from localmind.store import Store
+    with Store(db) as store:
+        run = store.get_run(run_id)
+    assert run["audio_asset"]["duration_sec"] == pytest.approx(2.0)
+    assert len(run["segments"]) >= 1
+    assert run["summary"] is not None
+    assert run["inference_run"]["status"] == "ok"
+
+
+def test_analyze_persists_failed_summary_to_store(tmp_path, monkeypatch):
+    _patch_llm(monkeypatch, "always_invalid")
+    wav = _wav(tmp_path)
+    db = tmp_path / "s.db"
+    rc, out, _ = _run(
+        ["analyze", str(wav), "--mock", "--store", str(db),
+         "--model-dir", str(tmp_path / "models"), "--chunk-sec", "1", "--overlap-sec", "0.1"],
+        tmp_path,
+    )
+    assert rc == 0
+    data = json.loads(out)
+    run_id = data["store_run_id"]
+    from localmind.store import Store
+    with Store(db) as store:
+        run = store.get_run(run_id)
+    assert run["inference_run"]["status"] == "failed"
+    assert run["summary"]["status"] == "failed"
+    assert run["summary"]["raw_output"]
+
+

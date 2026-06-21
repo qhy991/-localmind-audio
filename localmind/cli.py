@@ -292,6 +292,12 @@ def cmd_analyze(args, out: IO, err: IO) -> int:
     if not args.no_progress:
         _emit_progress(err, {"stage": "summarize", "fraction": 1.0})
 
+    store_run_id = None
+    if getattr(args, "store", None):
+        store_run_id = _persist_run(
+            args, source, segments, stt_provenance, summarizer, summary
+        )
+
     result = {
         "schema_version": CLI_OUTPUT_SCHEMA_VERSION,
         "command": "analyze",
@@ -304,8 +310,50 @@ def cmd_analyze(args, out: IO, err: IO) -> int:
         },
         "summary": summary,
     }
+    if store_run_id is not None:
+        result["store_run_id"] = store_run_id
     _emit_json(out, result)
     return 0
+
+
+def _persist_run(args, source, segments, stt_provenance, summarizer, summary) -> str:
+    """Persist an analyze run to the normalized store. Returns the run id."""
+    from localmind.store import ReferenceIntegrityError, Store
+
+    stt_prov = _provenance_to_dict(stt_provenance) or {}
+    status = "failed" if summary.get("status") == "failed" else "ok"
+    store = Store(args.store)
+    try:
+        asset_id = store.put_audio_asset(
+            path=args.audio, duration_sec=source.duration_sec, sample_rate=16000,
+            fmt=Path(args.audio).suffix.lower().lstrip("."),
+        )
+        run_id = store.put_run(
+            asset_id,
+            stt_tier=("mock" if args.mock else args.tier),
+            stt_model_id=stt_prov.get("model_id", ""),
+            stt_sha256=stt_prov.get("sha256", ""),
+            llm_model_id=summarizer.model_id,
+            prompt_template_hash=summarizer.prompt_template_hash,
+            chunk_duration_sec=args.chunk_sec,
+            overlap_sec=args.overlap_sec,
+            schema_version=CLI_OUTPUT_SCHEMA_VERSION,
+            status=status,
+        )
+        if stt_prov.get("model_id"):
+            store.put_model_ref(
+                run_id, model_id=stt_prov["model_id"], kind="whisper",
+                sha256=stt_prov.get("sha256", ""),
+                quant_format=stt_prov.get("quant_format", ""),
+                path=stt_prov.get("model_path", ""),
+            )
+        store.put_segments(run_id, segments)
+        store.put_summary(run_id, summary)
+        return run_id
+    except ReferenceIntegrityError as exc:
+        raise CliError(f"summary failed reference-integrity check: {exc}") from exc
+    finally:
+        store.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -340,6 +388,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze = sub.add_parser("analyze", help="transcribe + summarize in one pass")
     add_common(p_analyze)
     p_analyze.add_argument("--llm-tier", default="qwen2.5-7b", help="LLM model id (real backend)")
+    p_analyze.add_argument("--store", default=None, help="persist artifacts to this SQLite store path")
     p_analyze.set_defaults(func=cmd_analyze)
 
     return parser
