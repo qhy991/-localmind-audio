@@ -10,6 +10,7 @@ from localmind.summary.schema import (
     validate_summary_sections,
 )
 from localmind.summary.summarizer import (
+    MlxLmSummaryLLM,
     MockSummaryLLM,
     SummaryLLM,
     Summarizer,
@@ -23,6 +24,7 @@ __all__ = [
     "validate_summary_dict",
     "validate_summary_failed_dict",
     "validate_summary_sections",
+    "MlxLmSummaryLLM",
     "MockSummaryLLM",
     "SummaryLLM",
     "Summarizer",

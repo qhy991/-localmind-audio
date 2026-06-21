@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import socket
+import sys
 
 import pytest
 
+from localmind.provisioning import Provisioner
 from localmind.stt.segment import TranscriptSegment
 from localmind.summary import (
     SUMMARY_SCHEMA_VERSION,
+    MlxLmSummaryLLM,
     MockSummaryLLM,
     Summarizer,
     SummaryValidationError,
@@ -231,3 +235,86 @@ def test_summarizer_zero_repair_attempts_fails_on_invalid():
     validate_summary_failed_dict(summary)
     assert llm.map_calls == 1  # no repair attempted
     assert llm.reduce_calls == 0
+
+
+# --------------------------------------------------------------------------- #
+# MlxLmSummaryLLM: real adapter with fake mlx_lm                              #
+# --------------------------------------------------------------------------- #
+
+def _prov_with_llm_model(tmp_path, model_id="qwen-7b"):
+    import hashlib
+    model_dir = tmp_path / "models"
+    content = b"llm-weights" * 100
+    p = model_dir / f"{model_id}.gguf"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(content)
+    (model_dir / "models.json").write_text(json.dumps({
+        "schema_version": "1",
+        "models": [{
+            "model_id": model_id, "name": model_id, "kind": "llm",
+            "path": f"{model_id}.gguf", "quant_format": "int4",
+            "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+            "license": "Apache-2.0",
+        }],
+    }))
+    return Provisioner(model_dir)
+
+
+class _FakeMlxLm:
+    """Fake mlx_lm module: load returns dummy objects, generate returns text."""
+
+    def __init__(self, response='{"decisions":[],"action_items":[],"open_questions":[]}'):
+        self.response = response
+        self.load_calls = []
+        self.generate_calls = []
+
+    def load(self, path):
+        self.load_calls.append(path)
+        return ("fake_model", "fake_tokenizer")
+
+    def generate(self, model, tokenizer, prompt=None, max_tokens=1024):
+        self.generate_calls.append(prompt)
+        return self.response
+
+
+def test_mlxlm_llm_generates_with_verified_path(tmp_path, monkeypatch):
+    prov = _prov_with_llm_model(tmp_path)
+    fake = _FakeMlxLm("a summary text")
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake)
+
+    llm = MlxLmSummaryLLM(prov, "qwen-7b")
+    result = llm.generate("summarize this")
+
+    assert result == "a summary text"
+    assert len(fake.load_calls) == 1
+    assert "qwen-7b.gguf" in fake.load_calls[0]
+    assert llm.last_provenance is not None
+    assert llm.last_provenance.model_id == "qwen-7b"
+    assert len(llm.last_provenance.sha256) == 64
+
+
+def test_mlxlm_llm_rejects_non_provisioner():
+    llm = MlxLmSummaryLLM("not-a-provisioner", "qwen-7b")
+    with pytest.raises(TypeError, match="Provisioner"):
+        llm.generate("prompt")
+
+
+def test_mlxlm_llm_raises_without_mlx_lm(tmp_path, monkeypatch):
+    prov = _prov_with_llm_model(tmp_path)
+    monkeypatch.setitem(sys.modules, "mlx_lm", None)
+    llm = MlxLmSummaryLLM(prov, "qwen-7b")
+    with pytest.raises(RuntimeError, match="mlx-lm"):
+        llm.generate("prompt")
+
+
+def test_mlxlm_llm_does_not_touch_network(tmp_path, monkeypatch):
+    prov = _prov_with_llm_model(tmp_path)
+    fake = _FakeMlxLm("response")
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake)
+
+    def _no_network(*_a, **_k):
+        raise AssertionError("LLM adapter attempted a network connection")
+
+    monkeypatch.setattr(socket, "socket", _no_network)
+    llm = MlxLmSummaryLLM(prov, "qwen-7b")
+    llm.generate("prompt")  # would raise via _no_network if network path were taken

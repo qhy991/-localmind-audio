@@ -49,7 +49,7 @@ from localmind.stt import (
 )
 from localmind.stt.segment import TranscriptSegment
 from localmind.stt.transcriber import Transcriber
-from localmind.summary import MockSummaryLLM, Summarizer, SummaryLLM
+from localmind.summary import MockSummaryLLM, MlxLmSummaryLLM, Summarizer, SummaryLLM
 
 # Bumping this is a breaking change caught by the contract tests.
 CLI_OUTPUT_SCHEMA_VERSION = "1"
@@ -215,11 +215,15 @@ def cmd_benchmark(args, out: IO, err: IO) -> int:
 def _select_summary_llm(args) -> SummaryLLM:
     if args.mock:
         return MockSummaryLLM()
-    # The real LLM backend (mlx-lm / llama.cpp) adapter is pending; require --mock.
-    raise CliError(
-        "the real LLM backend is not wired yet; pass --mock for an offline "
-        "contract run (see docs/provisioning.md)"
-    )
+    try:
+        import mlx_lm  # noqa: F401
+    except ImportError:
+        raise CliError(
+            "mlx-lm is not installed; pass --mock for an offline contract run, "
+            "or install the ML backend with `pip install -e .[ml]` "
+            "(see docs/provisioning.md)"
+        )
+    return MlxLmSummaryLLM(Provisioner(args.model_dir), args.llm_tier)
 
 
 def _load_segments(transcript_path) -> List[TranscriptSegment]:
@@ -320,7 +324,7 @@ def cmd_analyze(args, out: IO, err: IO) -> int:
     store_run_id = None
     if getattr(args, "store", None):
         store_run_id, metrics = _persist_run(
-            args, source, segments, stt_provenance, summarizer, summary,
+            args, source, segments, stt_provenance, summarizer, summary, llm,
             decode_sec, stt_sec, llm_sec,
         )
     else:
@@ -345,7 +349,7 @@ def cmd_analyze(args, out: IO, err: IO) -> int:
     return 0
 
 
-def _persist_run(args, source, segments, stt_provenance, summarizer, summary,
+def _persist_run(args, source, segments, stt_provenance, summarizer, summary, llm,
                  decode_sec, stt_sec, llm_sec):
     """Persist an analyze run atomically with measured metrics; return (run_id, metrics).
 
@@ -366,12 +370,13 @@ def _persist_run(args, source, segments, stt_provenance, summarizer, summary,
         "quant_format": stt_prov.get("quant_format", ""),
         "path": stt_prov.get("model_path", ""),
     }
+    llm_prov = getattr(llm, "last_provenance", None)
     llm_ref = {
-        "model_id": summarizer.model_id,
+        "model_id": (llm_prov.model_id if llm_prov else summarizer.model_id),
         "kind": "llm",
-        "sha256": "",
-        "quant_format": "",
-        "path": "",
+        "sha256": (llm_prov.sha256 if llm_prov else ""),
+        "quant_format": (llm_prov.quant_format if llm_prov else ""),
+        "path": (str(llm_prov.model_path) if llm_prov else ""),
     }
 
     def build_metrics(persist_sec, audio_duration):
@@ -472,6 +477,13 @@ def main(argv: Optional[List[str]] = None, out: IO = None, err: IO = None) -> in
             "schema_version": CLI_OUTPUT_SCHEMA_VERSION,
             "command": args.command,
             "error": {"code": "provisioning_error", "message": str(exc)},
+        })
+        return 1
+    except RuntimeError as exc:
+        _emit_json(out, {
+            "schema_version": CLI_OUTPUT_SCHEMA_VERSION,
+            "command": args.command,
+            "error": {"code": "runtime_error", "message": str(exc)},
         })
         return 1
 

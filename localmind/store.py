@@ -20,7 +20,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from localmind.summary.schema import (
     SummaryValidationError,
@@ -338,7 +338,7 @@ class Store:
         or the UPDATE — the entire transaction rolls back: no orphaned rows.
 
         Returns ``(run_id, metrics)``. The measurement boundary is "through the
-        final metrics UPDATE before commit", used consistently for stored and
+        last INSERT before the metrics UPDATE", used consistently for stored and
         stdout metrics.
         """
         conn = self._conn

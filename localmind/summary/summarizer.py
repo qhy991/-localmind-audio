@@ -28,6 +28,9 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 
 from localmind.stt.segment import TranscriptSegment
+from localmind.provisioning.provisioner import Provisioner
+from localmind.provisioning.errors import ModelNotProvisionedError
+from localmind.stt.transcriber import resolve_tier, ResolvedTier
 from localmind.summary.schema import (
     SUMMARY_SCHEMA_VERSION,
     SummaryValidationError,
@@ -104,6 +107,49 @@ class MockSummaryLLM(SummaryLLM):
             "action_items": [],
             "open_questions": [],
         })
+
+
+class MlxLmSummaryLLM(SummaryLLM):
+    """Real local LLM adapter over mlx-lm, bound to verified provisioning.
+
+    Like :class:`~localmind.stt.WhisperTranscriber`, this adapter owns the
+    model-resolution boundary: callers pass a :class:`Provisioner` and a model
+    id, and the adapter calls :func:`resolve_tier` (which runs
+    ``Provisioner.require_model``) on the first ``generate`` call. A pre-built
+    path or repo id is never accepted. After generation,
+    ``self.last_provenance`` holds the :class:`ResolvedTier` for downstream run
+    records.
+    """
+
+    def __init__(self, provisioner: Provisioner, model_id: str, max_tokens: int = 1024):
+        self.provisioner = provisioner
+        self.model_id = model_id
+        self.max_tokens = max_tokens
+        self.last_provenance: Optional[ResolvedTier] = None
+        self._model = None
+        self._tokenizer = None
+
+    def generate(self, prompt: str) -> str:
+        if not isinstance(self.provisioner, Provisioner):
+            raise TypeError(
+                "MlxLmSummaryLLM requires a Provisioner; pre-built paths or "
+                "repo ids are not accepted"
+            )
+        if self.last_provenance is None:
+            self.last_provenance = resolve_tier(self.provisioner, self.model_id)
+        try:
+            import mlx_lm
+        except ImportError as exc:
+            raise RuntimeError(
+                "mlx-lm is not installed; install the ML backend with "
+                "`pip install -e .[ml]` (see docs/provisioning.md)"
+            ) from exc
+        if self._model is None:
+            self._model, self._tokenizer = mlx_lm.load(str(self.last_provenance.model_path))
+        return mlx_lm.generate(
+            self._model, self._tokenizer,
+            prompt=prompt, max_tokens=self.max_tokens,
+        )
 
 
 def _chunk_segments_by_chars(
