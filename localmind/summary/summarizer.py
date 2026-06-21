@@ -137,6 +137,11 @@ class MlxLmSummaryLLM(SummaryLLM):
             )
         if self.last_provenance is None:
             self.last_provenance = resolve_tier(self.provisioner, self.model_id)
+        if self.last_provenance.kind != "llm":
+            raise ModelNotProvisionedError(
+                f"model {self.model_id!r} has kind={self.last_provenance.kind!r}, "
+                f"not 'llm'; cannot load as an LLM"
+            )
         try:
             import mlx_lm
         except ImportError as exc:

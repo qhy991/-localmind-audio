@@ -190,4 +190,21 @@ zero-network guarantee and the missing-tier fast-fail both hold at the adapter
 boundary. The resolved tier is recorded on `transcriber.last_provenance` for
 downstream run records; it is not accepted as input authority.
 
+## 8. Installing the LLM backend
+
+The real structured-summary backend (`MlxLmSummaryLLM`) uses `mlx-lm`, declared
+in the same `ml` extra as `mlx-whisper`. Install both backends with:
+
+```bash
+.venv/bin/python -m pip install -e ".[ml]"
+```
+
+`MlxLmSummaryLLM(provisioner, model_id)` resolves the LLM tier through
+`Provisioner.require_model()` (size + SHA-256 + model-dir confinement) and
+additionally enforces that the manifest entry's `kind` is `"llm"` — a Whisper
+entry cannot be loaded as an LLM. A missing or tampered model fast-fails before
+`mlx_lm.load()` is called. The resolved tier is recorded on
+`adapter.last_provenance` for the store's `model_manifest_ref` (model_id, sha256,
+quant_format, path). A pre-built path or Hugging Face repo id is never accepted.
+
 

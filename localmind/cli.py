@@ -437,6 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_summarize = sub.add_parser("summarize", help="summarize a transcript JSON")
     p_summarize.add_argument("transcript", help="path to a transcript JSON (transcribe output)")
+    p_summarize.add_argument("--model-dir", default="models", help="provisioned model directory")
     p_summarize.add_argument("--mock", action="store_true", help="use MockSummaryLLM (no LLM backend)")
     p_summarize.add_argument("--llm-tier", default="qwen2.5-7b", help="LLM model id (real backend)")
     p_summarize.add_argument("--no-progress", action="store_true", help="suppress JSONL progress events")

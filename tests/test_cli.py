@@ -237,6 +237,75 @@ def test_cli_summary_schema_version_pinned():
 
 
 # --------------------------------------------------------------------------- #
+# summarize non-mock: --model-dir + fake mlx_lm                               #
+# --------------------------------------------------------------------------- #
+
+class _FakeMlxLmForCli:
+    """Fake mlx_lm that returns valid sections JSON citing seg-0000."""
+    def load(self, path):
+        return ("model", "tokenizer")
+
+    def generate(self, model, tokenizer, prompt=None, max_tokens=1024):
+        return json.dumps({
+            "decisions": [{"text": "a decision", "citations": ["seg:seg-0000"]}],
+            "action_items": [{"text": "do it", "owner": None, "due_date": None, "citations": ["seg:seg-0000"]}],
+            "open_questions": [],
+        })
+
+
+def _llm_manifest(tmp_path, model_id="qwen-7b"):
+    import hashlib
+    model_dir = tmp_path / "models"
+    content = b"llm-weights" * 50
+    p = model_dir / f"{model_id}.gguf"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(content)
+    (model_dir / "models.json").write_text(json.dumps({
+        "schema_version": "1",
+        "models": [{
+            "model_id": model_id, "name": model_id, "kind": "llm",
+            "path": f"{model_id}.gguf", "quant_format": "int4",
+            "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+            "license": "Apache-2.0",
+        }],
+    }))
+    return model_dir
+
+
+def test_summarize_nonmock_with_valid_llm_manifest(tmp_path, monkeypatch):
+    """Non-mock summarize with a valid LLM manifest and fake mlx_lm returns
+    structured JSON — not an AttributeError crash."""
+    monkeypatch.setitem(__import__("sys").modules, "mlx_lm", _FakeMlxLmForCli())
+    segs = [{"id": "seg-0000", "start": 0.0, "end": 1.0, "text": "hello"}]
+    tjson = _transcript_json(tmp_path, segs)
+    _llm_manifest(tmp_path, "qwen-7b")
+    rc, out, _ = _run(
+        ["summarize", str(tjson), "--model-dir", str(tmp_path / "models"), "--llm-tier", "qwen-7b"],
+        tmp_path,
+    )
+    assert rc == 0
+    summary = json.loads(out)
+    assert summary["schema_version"] == "soundmind.summary.v1"
+    assert len(summary["decisions"]) >= 1
+
+
+def test_summarize_nonmock_missing_manifest(tmp_path, monkeypatch):
+    """Non-mock summarize with no manifest returns a structured error — not
+    an uncaught AttributeError."""
+    monkeypatch.setitem(__import__("sys").modules, "mlx_lm", _FakeMlxLmForCli())
+    segs = [{"id": "seg-0000", "start": 0.0, "end": 1.0, "text": "hello"}]
+    tjson = _transcript_json(tmp_path, segs)
+    rc, out, _ = _run(
+        ["summarize", str(tjson), "--model-dir", str(tmp_path / "no-models"), "--llm-tier", "qwen-7b"],
+        tmp_path,
+    )
+    assert rc == 1
+    data = json.loads(out)
+    assert "error" in data
+    assert data["error"]["code"] in {"provisioning_error", "cli_error"}
+
+
+# --------------------------------------------------------------------------- #
 # CLI repair / failure contract (structured-summary via CLI)                  #
 # --------------------------------------------------------------------------- #
 

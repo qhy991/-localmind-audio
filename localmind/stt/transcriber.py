@@ -53,6 +53,7 @@ class ResolvedTier:
     model_path: Path
     sha256: str
     quant_format: str
+    kind: str = ""
 
 
 def resolve_tier(provisioner: Provisioner, tier_model_id: str) -> ResolvedTier:
@@ -77,6 +78,7 @@ def resolve_tier(provisioner: Provisioner, tier_model_id: str) -> ResolvedTier:
         model_path=path,
         sha256=entry.sha256,
         quant_format=entry.quant_format,
+        kind=entry.kind,
     )
 
 

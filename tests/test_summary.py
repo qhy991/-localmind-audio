@@ -9,6 +9,7 @@ import sys
 import pytest
 
 from localmind.provisioning import Provisioner
+from localmind.provisioning.errors import ModelNotProvisionedError
 from localmind.stt.segment import TranscriptSegment
 from localmind.summary import (
     SUMMARY_SCHEMA_VERSION,
@@ -318,3 +319,30 @@ def test_mlxlm_llm_does_not_touch_network(tmp_path, monkeypatch):
     monkeypatch.setattr(socket, "socket", _no_network)
     llm = MlxLmSummaryLLM(prov, "qwen-7b")
     llm.generate("prompt")  # would raise via _no_network if network path were taken
+
+
+def test_mlxlm_llm_rejects_non_llm_kind(tmp_path, monkeypatch):
+    """A manifest entry with kind='whisper' cannot be loaded as an LLM."""
+    import hashlib
+    model_dir = tmp_path / "models"
+    content = b"whisper-weights" * 100
+    p = model_dir / "whisper-small.mlmodel"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(content)
+    (model_dir / "models.json").write_text(json.dumps({
+        "schema_version": "1",
+        "models": [{
+            "model_id": "whisper-small", "name": "w", "kind": "whisper",
+            "path": "whisper-small.mlmodel", "quant_format": "int4",
+            "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+            "license": "MIT",
+        }],
+    }))
+    prov = Provisioner(model_dir)
+    fake = _FakeMlxLm("should not be called")
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake)
+
+    llm = MlxLmSummaryLLM(prov, "whisper-small")
+    with pytest.raises(ModelNotProvisionedError, match="kind"):
+        llm.generate("prompt")
+    assert len(fake.load_calls) == 0  # mlx_lm.load never called for non-LLM kind
