@@ -324,6 +324,13 @@ def test_analyze_persists_to_store(tmp_path):
     assert len(run["segments"]) >= 1
     assert run["summary"] is not None
     assert run["inference_run"]["status"] == "ok"
+    # Stage metrics + STT/LLM model refs are persisted with complete provenance.
+    assert run["inference_run"]["metrics_json"] is not None
+    metrics = json.loads(run["inference_run"]["metrics_json"])
+    stage_names = {s["stage"] for s in metrics["stages"]}
+    assert stage_names == {"decode", "stt", "llm", "persist"}
+    ref_kinds = {r["kind"] for r in run["model_manifest_refs"]}
+    assert ref_kinds == {"whisper", "llm"}
 
 
 def test_analyze_persists_failed_summary_to_store(tmp_path, monkeypatch):

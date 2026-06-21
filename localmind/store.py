@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS transcript_segment (
     start REAL NOT NULL,
     end REAL NOT NULL,
     text TEXT NOT NULL,
-    UNIQUE(run_id, seg_id)
+    UNIQUE(run_id, seg_id),
+    UNIQUE(run_id, ord)
 );
 CREATE TABLE IF NOT EXISTS summary_artifact (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -226,10 +227,94 @@ class Store:
             "SELECT * FROM summary_artifact WHERE run_id=? ORDER BY id DESC LIMIT 1",
             (run_id,),
         ).fetchone()
+        ref_rows = self._conn.execute(
+            "SELECT model_id,kind,sha256,quant_format,path FROM model_manifest_ref "
+            "WHERE run_id=? ORDER BY id",
+            (run_id,),
+        ).fetchall()
         return {
             "run_id": run_id,
             "audio_asset": dict(asset) if asset else None,
             "inference_run": dict(row),
             "segments": self.stored_segments(run_id),
             "summary": json.loads(summary["payload_json"]) if summary else None,
+            "model_manifest_refs": [dict(r) for r in ref_rows],
         }
+
+    def put_full_run(
+        self,
+        *,
+        audio: Dict,
+        run: Dict,
+        model_refs: List[Dict],
+        segments,
+        summary: Dict,
+    ) -> str:
+        """Persist a complete run atomically in a single transaction.
+
+        If summary validation fails (e.g. a citation references a segment not in
+        ``segments``), the entire run is rolled back — no orphaned
+        ``inference_run``/segments/asset rows remain. ``audio`` has keys
+        path/duration_sec/sample_rate/format/sha256; ``run`` has the inference_run
+        fields (stt_*, llm_model_id, prompt_template_hash, chunk/overlap,
+        schema_version, status, metrics); each ``model_refs`` item has
+        model_id/kind/sha256/quant_format/path.
+        """
+        conn = self._conn
+        asset_id = _uuid()
+        run_id = _uuid()
+        try:
+            conn.execute(
+                "INSERT INTO audio_asset(id,path,duration_sec,sample_rate,format,sha256,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (asset_id, str(audio["path"]), float(audio["duration_sec"]),
+                 int(audio.get("sample_rate", 16000)), audio.get("format", ""),
+                 audio.get("sha256", ""), _now()),
+            )
+            conn.execute(
+                "INSERT INTO inference_run(id,audio_asset_id,stt_tier,stt_model_id,stt_sha256,"
+                "llm_model_id,prompt_template_hash,chunk_duration_sec,overlap_sec,schema_version,"
+                "status,metrics_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, asset_id, run.get("stt_tier", ""), run.get("stt_model_id", ""),
+                 run.get("stt_sha256", ""), run.get("llm_model_id", ""),
+                 run.get("prompt_template_hash", ""), float(run.get("chunk_duration_sec", 0.0)),
+                 float(run.get("overlap_sec", 0.0)), run.get("schema_version", ""),
+                 run.get("status", "ok"),
+                 json.dumps(run["metrics"]) if run.get("metrics") is not None else None, _now()),
+            )
+            for ref in model_refs:
+                conn.execute(
+                    "INSERT INTO model_manifest_ref(run_id,model_id,kind,sha256,quant_format,path) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (run_id, ref.get("model_id", ""), ref.get("kind", ""),
+                     ref.get("sha256", ""), ref.get("quant_format", ""), ref.get("path", "")),
+                )
+            for ord_i, s in enumerate(segments):
+                conn.execute(
+                    "INSERT INTO transcript_segment(run_id,ord,seg_id,start,end,text) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (run_id, ord_i, str(_seg_field(s, "id")), float(_seg_field(s, "start")),
+                     float(_seg_field(s, "end")), str(_seg_field(s, "text"))),
+                )
+            # Validate summary against the segments about to be committed (in-memory).
+            if summary.get("status") == "failed":
+                validate_summary_failed_dict(summary)
+                status_val = "failed"
+            else:
+                try:
+                    validate_summary_dict(summary)
+                    validate_summary_against_transcript(summary, segments)
+                except SummaryValidationError as exc:
+                    raise ReferenceIntegrityError(str(exc)) from exc
+                status_val = "ok"
+            conn.execute(
+                "INSERT INTO summary_artifact(run_id,status,payload_json,created_at) "
+                "VALUES(?,?,?,?)",
+                (run_id, status_val, json.dumps(summary), _now()),
+            )
+            conn.commit()
+            return run_id
+        except Exception:
+            conn.rollback()
+            raise
+

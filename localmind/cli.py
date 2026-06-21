@@ -265,43 +265,70 @@ def cmd_summarize(args, out: IO, err: IO) -> int:
 
 
 def cmd_analyze(args, out: IO, err: IO) -> int:
-    # Stage 1: transcribe.
+    transcriber = _select_transcriber(args)
+    provisioner = None if args.mock else Provisioner(args.model_dir)
+    stt_tier = "mock" if args.mock else args.tier
+    config = ChunkingConfig(chunk_duration_sec=args.chunk_sec, overlap_sec=args.overlap_sec)
+
+    # Stage: decode (source setup: open/header/probe).
+    t0 = time.perf_counter()
     try:
         source = audio_source_from_path(args.audio, target_sample_rate=16000)
     except (AudioError, OSError) as exc:
         raise CliError(f"cannot open audio source {args.audio}: {exc}") from exc
-
-    config = ChunkingConfig(chunk_duration_sec=args.chunk_sec, overlap_sec=args.overlap_sec)
-    transcriber = _select_transcriber(args)
-    provisioner = None if args.mock else Provisioner(args.model_dir)
-    stt_tier = "mock" if args.mock else args.tier
+    decode_sec = time.perf_counter() - t0
 
     def on_stt(fraction: float) -> None:
         if not args.no_progress:
             _emit_progress(err, {"stage": "stt", "fraction": round(float(fraction), 4)})
 
+    # Stage: STT.
+    t0 = time.perf_counter()
     segments = transcriber.transcribe(source, config, provisioner, stt_tier, on_stt)
+    stt_sec = time.perf_counter() - t0
     stt_provenance = getattr(transcriber, "last_provenance", None)
 
-    # Stage 2: summarize.
+    # Stage: LLM summarize.
     llm = _select_summary_llm(args)
     summarizer = Summarizer(llm, model_id="mock-llm" if args.mock else args.llm_tier)
     if not args.no_progress:
         _emit_progress(err, {"stage": "summarize", "fraction": 0.0})
+    t0 = time.perf_counter()
     summary = summarizer.summarize(segments, case_id=Path(args.audio).stem)
+    llm_sec = time.perf_counter() - t0
     if not args.no_progress:
         _emit_progress(err, {"stage": "summarize", "fraction": 1.0})
 
+    # Stage: persist (if --store).
     store_run_id = None
+    persist_sec = 0.0
     if getattr(args, "store", None):
+        t0 = time.perf_counter()
         store_run_id = _persist_run(
-            args, source, segments, stt_provenance, summarizer, summary
+            args, source, segments, stt_provenance, summarizer, summary,
+            decode_sec, stt_sec, llm_sec,
         )
+        persist_sec = time.perf_counter() - t0
+
+    audio_duration = source.duration_sec
+    total = decode_sec + stt_sec + llm_sec + persist_sec
+    rtf = (total / audio_duration) if audio_duration > 0 else 0.0
+    metrics = {
+        "stages": [
+            {"stage": "decode", "duration_sec": decode_sec},
+            {"stage": "stt", "duration_sec": stt_sec},
+            {"stage": "llm", "duration_sec": llm_sec},
+            {"stage": "persist", "duration_sec": persist_sec},
+        ],
+        "total_duration_sec": total,
+        "rtf": rtf,
+        "peak_memory": [m.to_dict() for m in _peak_memory()],
+    }
 
     result = {
         "schema_version": CLI_OUTPUT_SCHEMA_VERSION,
         "command": "analyze",
-        "audio": {"path": str(Path(args.audio)), "duration_sec": source.duration_sec},
+        "audio": {"path": str(Path(args.audio)), "duration_sec": audio_duration},
         "stt_tier": stt_tier,
         "mock": bool(args.mock),
         "transcript": {
@@ -309,6 +336,7 @@ def cmd_analyze(args, out: IO, err: IO) -> int:
             "provenance": _provenance_to_dict(stt_provenance),
         },
         "summary": summary,
+        "metrics": metrics,
     }
     if store_run_id is not None:
         result["store_run_id"] = store_run_id
@@ -316,39 +344,66 @@ def cmd_analyze(args, out: IO, err: IO) -> int:
     return 0
 
 
-def _persist_run(args, source, segments, stt_provenance, summarizer, summary) -> str:
-    """Persist an analyze run to the normalized store. Returns the run id."""
+def _persist_run(args, source, segments, stt_provenance, summarizer, summary,
+                 decode_sec, stt_sec, llm_sec) -> str:
+    """Persist an analyze run atomically to the normalized store. Returns run id."""
     from localmind.store import ReferenceIntegrityError, Store
 
     stt_prov = _provenance_to_dict(stt_provenance) or {}
     status = "failed" if summary.get("status") == "failed" else "ok"
+    total = decode_sec + stt_sec + llm_sec  # persist measured by caller
+    audio_duration = source.duration_sec
+    metrics = {
+        "stages": [
+            {"stage": "decode", "duration_sec": decode_sec},
+            {"stage": "stt", "duration_sec": stt_sec},
+            {"stage": "llm", "duration_sec": llm_sec},
+            {"stage": "persist", "duration_sec": 0.0},  # filled post-hoc is not possible; record 0 here
+        ],
+        "total_duration_sec": total,
+        "rtf": (total / audio_duration) if audio_duration > 0 else 0.0,
+        "peak_memory": [m.to_dict() for m in _peak_memory()],
+    }
+
+    stt_ref = {
+        "model_id": stt_prov.get("model_id") or ("mock" if args.mock else args.tier),
+        "kind": "whisper",
+        "sha256": stt_prov.get("sha256", ""),
+        "quant_format": stt_prov.get("quant_format", ""),
+        "path": stt_prov.get("model_path", ""),
+    }
+    llm_ref = {
+        "model_id": summarizer.model_id,
+        "kind": "llm",
+        "sha256": "",
+        "quant_format": "",
+        "path": "",
+    }
+
     store = Store(args.store)
     try:
-        asset_id = store.put_audio_asset(
-            path=args.audio, duration_sec=source.duration_sec, sample_rate=16000,
-            fmt=Path(args.audio).suffix.lower().lstrip("."),
+        run_id = store.put_full_run(
+            audio={
+                "path": args.audio, "duration_sec": source.duration_sec,
+                "sample_rate": 16000,
+                "format": Path(args.audio).suffix.lower().lstrip("."),
+            },
+            run={
+                "stt_tier": ("mock" if args.mock else args.tier),
+                "stt_model_id": stt_ref["model_id"],
+                "stt_sha256": stt_ref["sha256"],
+                "llm_model_id": summarizer.model_id,
+                "prompt_template_hash": summarizer.prompt_template_hash,
+                "chunk_duration_sec": args.chunk_sec,
+                "overlap_sec": args.overlap_sec,
+                "schema_version": CLI_OUTPUT_SCHEMA_VERSION,
+                "status": status,
+                "metrics": metrics,
+            },
+            model_refs=[stt_ref, llm_ref],
+            segments=segments,
+            summary=summary,
         )
-        run_id = store.put_run(
-            asset_id,
-            stt_tier=("mock" if args.mock else args.tier),
-            stt_model_id=stt_prov.get("model_id", ""),
-            stt_sha256=stt_prov.get("sha256", ""),
-            llm_model_id=summarizer.model_id,
-            prompt_template_hash=summarizer.prompt_template_hash,
-            chunk_duration_sec=args.chunk_sec,
-            overlap_sec=args.overlap_sec,
-            schema_version=CLI_OUTPUT_SCHEMA_VERSION,
-            status=status,
-        )
-        if stt_prov.get("model_id"):
-            store.put_model_ref(
-                run_id, model_id=stt_prov["model_id"], kind="whisper",
-                sha256=stt_prov.get("sha256", ""),
-                quant_format=stt_prov.get("quant_format", ""),
-                path=stt_prov.get("model_path", ""),
-            )
-        store.put_segments(run_id, segments)
-        store.put_summary(run_id, summary)
         return run_id
     except ReferenceIntegrityError as exc:
         raise CliError(f"summary failed reference-integrity check: {exc}") from exc

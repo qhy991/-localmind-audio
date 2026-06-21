@@ -138,3 +138,83 @@ def test_reopen_in_new_process(tmp_path):
     assert data["n"] == len(segments)
     assert data["first_id"] == "seg-0000"
     assert data["status"] == "ok"
+
+
+# --------------------------------------------------------------------------- #
+# Atomic full-run persistence, model refs, segment ordering                   #
+# --------------------------------------------------------------------------- #
+
+def _refs():
+    return [
+        {"model_id": "whisper-small", "kind": "whisper", "sha256": "a" * 64, "quant_format": "int4", "path": "m.mlmodel"},
+        {"model_id": "qwen-7b", "kind": "llm", "sha256": "", "quant_format": "", "path": ""},
+    ]
+
+
+def test_put_full_run_roundtrip_with_refs(tmp_path):
+    with Store(tmp_path / "s.db") as store:
+        segments = [_seg(0, 0.0, 1.0), _seg(1, 1.0, 2.0)]
+        run_id = store.put_full_run(
+            audio={"path": "/tmp/x.wav", "duration_sec": 2.0, "sample_rate": 16000, "format": "wav"},
+            run={"stt_tier": "whisper-small", "stt_model_id": "whisper-small",
+                 "llm_model_id": "qwen-7b", "prompt_template_hash": "h",
+                 "chunk_duration_sec": 30.0, "overlap_sec": 1.0,
+                 "schema_version": "1", "status": "ok",
+                 "metrics": {"stages": [{"stage": "decode", "duration_sec": 0.1}], "total_duration_sec": 0.5, "rtf": 0.25}},
+            model_refs=_refs(),
+            segments=segments,
+            summary=_valid_summary(seg="seg-0000"),
+        )
+        run = store.get_run(run_id)
+    assert [s["id"] for s in run["segments"]] == ["seg-0000", "seg-0001"]
+    assert run["summary"]["case_id"] == _valid_summary(seg="seg-0000")["case_id"]
+    refs = run["model_manifest_refs"]
+    assert [r["kind"] for r in refs] == ["whisper", "llm"]
+    assert refs[0]["model_id"] == "whisper-small"
+    assert refs[1]["model_id"] == "qwen-7b"
+    assert run["inference_run"]["metrics_json"] is not None
+
+
+def test_put_full_run_atomic_rollback_on_bad_summary(tmp_path):
+    """A summary citing an unknown segment rolls back the entire run."""
+    with Store(tmp_path / "s.db") as store:
+        bad = _valid_summary(seg="seg-0000")
+        bad["decisions"][0]["citations"] = ["seg:seg-9999"]  # not in segments
+        with pytest.raises(ReferenceIntegrityError):
+            store.put_full_run(
+                audio={"path": "/tmp/x.wav", "duration_sec": 2.0, "sample_rate": 16000, "format": "wav"},
+                run={"stt_tier": "mock", "status": "ok", "metrics": {"stages": []}},
+                model_refs=_refs(),
+                segments=[_seg(0, 0.0, 1.0)],
+                summary=bad,
+            )
+        # No orphaned rows survive the rollback.
+        n_runs = store._conn.execute("SELECT COUNT(*) AS c FROM inference_run").fetchone()["c"]
+        n_segs = store._conn.execute("SELECT COUNT(*) AS c FROM transcript_segment").fetchone()["c"]
+        n_assets = store._conn.execute("SELECT COUNT(*) AS c FROM audio_asset").fetchone()["c"]
+    assert n_runs == 0
+    assert n_segs == 0
+    assert n_assets == 0
+
+
+def test_duplicate_ord_rejected(tmp_path):
+    """A second segment batch with a duplicate ordinal for the same run is rejected."""
+    with Store(tmp_path / "s.db") as store:
+        run_id, _segs, _ = _seed_run(store)
+        # put_segments starts ord at 0 again -> duplicate (run_id, ord=0).
+        with pytest.raises(sqlite3.IntegrityError):
+            store.put_segments(run_id, [_seg(2, 2.0, 3.0)])
+
+
+def test_get_run_returns_model_manifest_refs(tmp_path):
+    with Store(tmp_path / "s.db") as store:
+        run_id = store.put_full_run(
+            audio={"path": "/tmp/x.wav", "duration_sec": 1.0, "sample_rate": 16000, "format": "wav"},
+            run={"stt_tier": "mock", "status": "ok", "metrics": None},
+            model_refs=_refs(),
+            segments=[_seg(0, 0.0, 1.0)],
+            summary=_valid_summary(seg="seg-0000"),
+        )
+        run = store.get_run(run_id)
+    assert len(run["model_manifest_refs"]) == 2
+    assert {r["kind"] for r in run["model_manifest_refs"]} == {"whisper", "llm"}
