@@ -561,10 +561,32 @@ def test_whisper_transcriber_raises_clear_error_without_mlx_whisper(monkeypatch,
         )
 
 
-def test_whisper_transcriber_real_smoke_skips_without_backend_or_weights():
+def test_whisper_transcriber_real_smoke():
     """Real-backend smoke test: runs only when mlx_whisper and a provisioned
-    Whisper model are available; otherwise skips."""
+    Whisper model are available; otherwise skips. When it runs, it transcribes a
+    tiny local sample and asserts nonempty timestamped segments + provenance."""
     pytest.importorskip("mlx_whisper")
     model_dir = Path("models")
-    if not (model_dir / "models.json").exists():
+    manifest = model_dir / "models.json"
+    if not manifest.exists():
         pytest.skip("no provisioned models/ directory for real Whisper smoke test")
+
+    # Pick any whisper-kind tier declared in the manifest.
+    import json as _json
+    declared = _json.loads(manifest.read_text())["models"]
+    whisper_tiers = [m["model_id"] for m in declared if m.get("kind") == "whisper"]
+    if not whisper_tiers:
+        pytest.skip("no whisper-kind tier provisioned in models/models.json")
+    tier = whisper_tiers[0]
+
+    import tempfile
+    wav = _write_sine_wav(Path(tempfile.mkdtemp()) / "smoke.wav", duration_sec=2.0, sr=16000)
+
+    prov = Provisioner(model_dir)
+    source = audio_source_from_path(wav, target_sample_rate=16000)
+    t = WhisperTranscriber()
+    segments = t.transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), prov, tier)
+    assert len(segments) >= 1
+    validate_segments(segments, audio_duration_sec=source.duration_sec)
+    assert t.last_provenance is not None
+    assert t.last_provenance.model_id == tier

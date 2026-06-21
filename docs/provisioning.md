@@ -180,10 +180,14 @@ Install it (on Python 3.11+, Apple Silicon) with:
 .venv/bin/python -m pip install -e ".[ml]"
 ```
 
-`WhisperTranscriber.transcribe()` accepts a `ResolvedTier` from
-`resolve_tier()`, never a raw path or a Hugging Face repo id. It asserts the
-model path exists locally before calling `mlx_whisper.transcribe`, so the
-runtime cannot be tricked into a network model pull — the zero-network guarantee
-(AC-5) and the missing-tier fast-fail (AC-2/AC-9) both hold at the adapter
-boundary.
+`WhisperTranscriber.transcribe(source, config, provisioner, tier_model_id)`
+takes a `Provisioner` and a tier id — **not** a pre-built `ResolvedTier`, a raw
+path, or a Hugging Face repo id. The adapter calls `resolve_tier()` internally
+(running `Provisioner.require_model` → size + SHA-256 + model-dir confinement)
+immediately before invoking `mlx_whisper`, and passes only that freshly verified
+path. A missing or tampered tier fast-fails before the backend runs, so the
+zero-network guarantee and the missing-tier fast-fail both hold at the adapter
+boundary. The resolved tier is recorded on `transcriber.last_provenance` for
+downstream run records; it is not accepted as input authority.
+
 
