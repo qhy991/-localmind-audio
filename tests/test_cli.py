@@ -351,6 +351,8 @@ def test_analyze_persists_failed_summary_to_store(tmp_path, monkeypatch):
     assert run["inference_run"]["status"] == "failed"
     assert run["summary"]["status"] == "failed"
     assert run["summary"]["raw_output"]
+    # Even a failed-summary run has non-null metrics (persist measured atomically).
+    assert run["inference_run"]["metrics_json"] is not None
 
 
 def test_analyze_store_metrics_match_stdout(tmp_path):

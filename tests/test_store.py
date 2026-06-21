@@ -218,3 +218,50 @@ def test_get_run_returns_model_manifest_refs(tmp_path):
         run = store.get_run(run_id)
     assert len(run["model_manifest_refs"]) == 2
     assert {r["kind"] for r in run["model_manifest_refs"]} == {"whisper", "llm"}
+
+
+def test_put_full_run_with_metrics_atomic_rollback_on_metrics_failure(tmp_path):
+    """If the metrics callback fails, the entire run rolls back — no orphaned
+    rows in any of the five store tables."""
+    with Store(tmp_path / "s.db") as store:
+        def bad_metrics(persist_sec, audio_duration):
+            raise RuntimeError("simulated metrics failure")
+
+        with pytest.raises(RuntimeError, match="simulated metrics failure"):
+            store.put_full_run_with_metrics(
+                audio={"path": "/tmp/x.wav", "duration_sec": 1.0, "sample_rate": 16000, "format": "wav"},
+                run={"stt_tier": "mock", "status": "ok"},
+                model_refs=_refs(),
+                segments=[_seg(0, 0.0, 1.0)],
+                summary=_valid_summary(seg="seg-0000"),
+                build_metrics=bad_metrics,
+            )
+        for table in ("audio_asset", "inference_run", "transcript_segment",
+                       "summary_artifact", "model_manifest_ref"):
+            n = store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            assert n == 0, f"{table} has {n} orphaned rows"
+
+
+def test_put_full_run_with_metrics_stores_non_null_metrics(tmp_path):
+    """A successful run has non-null metrics_json with the measured persist stage."""
+    with Store(tmp_path / "s.db") as store:
+        run_id, metrics = store.put_full_run_with_metrics(
+            audio={"path": "/tmp/x.wav", "duration_sec": 2.0, "sample_rate": 16000, "format": "wav"},
+            run={"stt_tier": "mock", "status": "ok"},
+            model_refs=_refs(),
+            segments=[_seg(0, 0.0, 1.0), _seg(1, 1.0, 2.0)],
+            summary=_valid_summary(seg="seg-0000"),
+            build_metrics=lambda persist, dur: {
+                "stages": [{"stage": "decode", "duration_sec": 0.1},
+                           {"stage": "stt", "duration_sec": 0.2},
+                           {"stage": "llm", "duration_sec": 0.3},
+                           {"stage": "persist", "duration_sec": persist}],
+                "total_duration_sec": 0.1 + 0.2 + 0.3 + persist,
+                "rtf": (0.1 + 0.2 + 0.3 + persist) / dur,
+            },
+        )
+        run = store.get_run(run_id)
+    assert run["inference_run"]["metrics_json"] is not None
+    stored = json.loads(run["inference_run"]["metrics_json"])
+    assert stored["stages"][3]["stage"] == "persist"
+    assert stored["stages"][3]["duration_sec"] > 0  # measured, not stale 0.0

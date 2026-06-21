@@ -347,12 +347,13 @@ def cmd_analyze(args, out: IO, err: IO) -> int:
 
 def _persist_run(args, source, segments, stt_provenance, summarizer, summary,
                  decode_sec, stt_sec, llm_sec):
-    """Persist an analyze run atomically; return (run_id, metrics).
+    """Persist an analyze run atomically with measured metrics; return (run_id, metrics).
 
-    The run is committed first with NULL metrics (the persist duration cannot be
-    known until the write completes), then the measured persist duration is
-    written back via ``update_run_metrics`` so stored metrics include all four
-    stages and match the stdout metrics exactly.
+    Uses ``put_full_run_with_metrics`` so the full run + metrics are committed
+    in a single transaction. The persist duration is measured inside the
+    transaction (through the last INSERT), and ``metrics_json`` is written
+    before commit. If anything fails, the entire run rolls back — no orphaned
+    rows.
     """
     from localmind.store import ReferenceIntegrityError, Store
 
@@ -373,10 +374,12 @@ def _persist_run(args, source, segments, stt_provenance, summarizer, summary,
         "path": "",
     }
 
+    def build_metrics(persist_sec, audio_duration):
+        return _build_metrics(decode_sec, stt_sec, llm_sec, persist_sec, audio_duration)
+
     store = Store(args.store)
     try:
-        t0 = time.perf_counter()
-        run_id = store.put_full_run(
+        run_id, metrics = store.put_full_run_with_metrics(
             audio={
                 "path": args.audio, "duration_sec": source.duration_sec,
                 "sample_rate": 16000,
@@ -392,15 +395,12 @@ def _persist_run(args, source, segments, stt_provenance, summarizer, summary,
                 "overlap_sec": args.overlap_sec,
                 "schema_version": CLI_OUTPUT_SCHEMA_VERSION,
                 "status": status,
-                "metrics": None,  # filled after measuring the persist duration
             },
             model_refs=[stt_ref, llm_ref],
             segments=segments,
             summary=summary,
+            build_metrics=build_metrics,
         )
-        persist_sec = time.perf_counter() - t0
-        metrics = _build_metrics(decode_sec, stt_sec, llm_sec, persist_sec, source.duration_sec)
-        store.update_run_metrics(run_id, metrics)
         return run_id, metrics
     except ReferenceIntegrityError as exc:
         raise CliError(f"summary failed reference-integrity check: {exc}") from exc

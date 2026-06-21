@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from localmind.summary.schema import (
     SummaryValidationError,
@@ -318,17 +319,91 @@ class Store:
             conn.rollback()
             raise
 
-    def update_run_metrics(self, run_id: str, metrics: Dict) -> None:
-        """Update the metrics_json for a committed run.
+    def put_full_run_with_metrics(
+        self,
+        *,
+        audio: Dict,
+        run: Dict,
+        model_refs: List[Dict],
+        segments,
+        summary: Dict,
+        build_metrics: Callable[[float, float], Dict],
+    ) -> Tuple[str, Dict]:
+        """Atomically persist a complete run WITH measured metrics in one transaction.
 
-        Used to record the measured persistence-stage duration, which cannot be
-        known until the run's transaction has completed. The run itself (asset,
-        segments, summary, refs) is already committed atomically by
-        :meth:`put_full_run`; this only updates the metrics payload.
+        Like :meth:`put_full_run`, but the persistence-stage duration is measured
+        inside the transaction (through the last INSERT), ``build_metrics`` is
+        called with that duration, and ``metrics_json`` is UPDATEd **before
+        commit**. If anything fails — summary validation, the metrics callback,
+        or the UPDATE — the entire transaction rolls back: no orphaned rows.
+
+        Returns ``(run_id, metrics)``. The measurement boundary is "through the
+        final metrics UPDATE before commit", used consistently for stored and
+        stdout metrics.
         """
-        self._conn.execute(
-            "UPDATE inference_run SET metrics_json=? WHERE id=?",
-            (json.dumps(metrics), run_id),
-        )
-        self._conn.commit()
+        conn = self._conn
+        asset_id = _uuid()
+        run_id = _uuid()
+        try:
+            t0 = time.perf_counter()
+            conn.execute(
+                "INSERT INTO audio_asset(id,path,duration_sec,sample_rate,format,sha256,created_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (asset_id, str(audio["path"]), float(audio["duration_sec"]),
+                 int(audio.get("sample_rate", 16000)), audio.get("format", ""),
+                 audio.get("sha256", ""), _now()),
+            )
+            conn.execute(
+                "INSERT INTO inference_run(id,audio_asset_id,stt_tier,stt_model_id,stt_sha256,"
+                "llm_model_id,prompt_template_hash,chunk_duration_sec,overlap_sec,schema_version,"
+                "status,metrics_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, asset_id, run.get("stt_tier", ""), run.get("stt_model_id", ""),
+                 run.get("stt_sha256", ""), run.get("llm_model_id", ""),
+                 run.get("prompt_template_hash", ""), float(run.get("chunk_duration_sec", 0.0)),
+                 float(run.get("overlap_sec", 0.0)), run.get("schema_version", ""),
+                 run.get("status", "ok"), None, _now()),  # metrics filled before commit
+            )
+            for ref in model_refs:
+                conn.execute(
+                    "INSERT INTO model_manifest_ref(run_id,model_id,kind,sha256,quant_format,path) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (run_id, ref.get("model_id", ""), ref.get("kind", ""),
+                     ref.get("sha256", ""), ref.get("quant_format", ""), ref.get("path", "")),
+                )
+            for ord_i, s in enumerate(segments):
+                conn.execute(
+                    "INSERT INTO transcript_segment(run_id,ord,seg_id,start,end,text) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (run_id, ord_i, str(_seg_field(s, "id")), float(_seg_field(s, "start")),
+                     float(_seg_field(s, "end")), str(_seg_field(s, "text"))),
+                )
+            if summary.get("status") == "failed":
+                validate_summary_failed_dict(summary)
+                status_val = "failed"
+            else:
+                try:
+                    validate_summary_dict(summary)
+                    validate_summary_against_transcript(summary, segments)
+                except SummaryValidationError as exc:
+                    raise ReferenceIntegrityError(str(exc)) from exc
+                status_val = "ok"
+            conn.execute(
+                "INSERT INTO summary_artifact(run_id,status,payload_json,created_at) "
+                "VALUES(?,?,?,?)",
+                (run_id, status_val, json.dumps(summary), _now()),
+            )
+            # Measure persist through the last INSERT, compute metrics, UPDATE
+            # metrics_json — all before commit, so a failure here rolls back
+            # the entire run.
+            persist_sec = time.perf_counter() - t0
+            metrics = build_metrics(persist_sec, float(audio["duration_sec"]))
+            conn.execute(
+                "UPDATE inference_run SET metrics_json=? WHERE id=?",
+                (json.dumps(metrics), run_id),
+            )
+            conn.commit()
+            return run_id, metrics
+        except Exception:
+            conn.rollback()
+            raise
 
