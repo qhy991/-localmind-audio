@@ -1,0 +1,11 @@
+# Runtime
+numpy>=1.26
+
+# Dev / test
+pytest>=8
+jsonschema>=4
+
+# ML backends (installed on demand for STT/LLM milestones, not needed for
+# provisioning + audio-decode foundation):
+#   mlx-whisper
+#   mlx-lm

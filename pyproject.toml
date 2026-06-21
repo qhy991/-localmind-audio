@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "localmind"
+version = "0.1.0"
+description = "LocalMind Audio — 100% on-device macOS voice-to-text + local-LLM analysis pipeline"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+ml = [
+    # Heavy ML backends, installed when needed by later milestones:
+    # mlx-whisper, mlx-lm
+]
+dev = [
+    "pytest>=8",
+    "jsonschema>=4",
+]
+
+[tool.setuptools.packages.find]
+include = ["localmind*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
