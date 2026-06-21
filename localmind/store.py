@@ -8,7 +8,7 @@ a successful summary's citations must reference transcript segments already
 stored for the same run (via the summary schema validator). A failed summary is
 stored as a ``summary_failed`` artifact rather than dropped.
 
-The M3 SwiftData layer will sit on top of this store as a facade, never a second
+A future SwiftData facade can sit on top of this store, never as a second
 source of truth.
 """
 
@@ -317,4 +317,18 @@ class Store:
         except Exception:
             conn.rollback()
             raise
+
+    def update_run_metrics(self, run_id: str, metrics: Dict) -> None:
+        """Update the metrics_json for a committed run.
+
+        Used to record the measured persistence-stage duration, which cannot be
+        known until the run's transaction has completed. The run itself (asset,
+        segments, summary, refs) is already committed atomically by
+        :meth:`put_full_run`; this only updates the metrics payload.
+        """
+        self._conn.execute(
+            "UPDATE inference_run SET metrics_json=? WHERE id=?",
+            (json.dumps(metrics), run_id),
+        )
+        self._conn.commit()
 

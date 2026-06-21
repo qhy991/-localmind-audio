@@ -12,7 +12,7 @@ Two kinds of fixture:
    like model weights; it is far too large to commit. A descriptor records the
    case id, expected duration, sample rate, channels, and the relative path
    where the provisioned file is expected, so the benchmark harness can locate
-   it (and skip cleanly when absent).
+   it (and fail clearly via :func:`require_fixture` when absent).
 """
 
 from __future__ import annotations

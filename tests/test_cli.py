@@ -353,3 +353,32 @@ def test_analyze_persists_failed_summary_to_store(tmp_path, monkeypatch):
     assert run["summary"]["raw_output"]
 
 
+def test_analyze_store_metrics_match_stdout(tmp_path):
+    """Stored metrics_json must include the measured persist stage and match the
+    stdout metrics (total/rtf within tolerance)."""
+    wav = _wav(tmp_path)
+    db = tmp_path / "s.db"
+    rc, out, _ = _run(
+        ["analyze", str(wav), "--mock", "--store", str(db),
+         "--model-dir", str(tmp_path / "models"), "--chunk-sec", "1", "--overlap-sec", "0.1"],
+        tmp_path,
+    )
+    assert rc == 0
+    data = json.loads(out)
+    stdout_metrics = data["metrics"]
+
+    from localmind.store import Store
+    with Store(db) as store:
+        run = store.get_run(data["store_run_id"])
+    stored_metrics = json.loads(run["inference_run"]["metrics_json"])
+
+    # Persist stage is measured (not the stale 0.0).
+    persist = {s["stage"]: s["duration_sec"] for s in stored_metrics["stages"]}["persist"]
+    assert persist > 0.0
+    # Stored totals match stdout within a small tolerance.
+    assert stored_metrics["total_duration_sec"] == pytest.approx(
+        stdout_metrics["total_duration_sec"], rel=1e-3, abs=1e-3
+    )
+    assert {s["stage"] for s in stored_metrics["stages"]} == {"decode", "stt", "llm", "persist"}
+
+

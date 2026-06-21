@@ -264,6 +264,22 @@ def cmd_summarize(args, out: IO, err: IO) -> int:
     return 0
 
 
+def _build_metrics(decode_sec, stt_sec, llm_sec, persist_sec, audio_duration):
+    total = decode_sec + stt_sec + llm_sec + persist_sec
+    rtf = (total / audio_duration) if audio_duration > 0 else 0.0
+    return {
+        "stages": [
+            {"stage": "decode", "duration_sec": decode_sec},
+            {"stage": "stt", "duration_sec": stt_sec},
+            {"stage": "llm", "duration_sec": llm_sec},
+            {"stage": "persist", "duration_sec": persist_sec},
+        ],
+        "total_duration_sec": total,
+        "rtf": rtf,
+        "peak_memory": [m.to_dict() for m in _peak_memory()],
+    }
+
+
 def cmd_analyze(args, out: IO, err: IO) -> int:
     transcriber = _select_transcriber(args)
     provisioner = None if args.mock else Provisioner(args.model_dir)
@@ -299,36 +315,21 @@ def cmd_analyze(args, out: IO, err: IO) -> int:
     if not args.no_progress:
         _emit_progress(err, {"stage": "summarize", "fraction": 1.0})
 
-    # Stage: persist (if --store).
+    # Stage: persist (if --store). The measured persist duration feeds both the
+    # stored and the stdout metrics so they match.
     store_run_id = None
-    persist_sec = 0.0
     if getattr(args, "store", None):
-        t0 = time.perf_counter()
-        store_run_id = _persist_run(
+        store_run_id, metrics = _persist_run(
             args, source, segments, stt_provenance, summarizer, summary,
             decode_sec, stt_sec, llm_sec,
         )
-        persist_sec = time.perf_counter() - t0
-
-    audio_duration = source.duration_sec
-    total = decode_sec + stt_sec + llm_sec + persist_sec
-    rtf = (total / audio_duration) if audio_duration > 0 else 0.0
-    metrics = {
-        "stages": [
-            {"stage": "decode", "duration_sec": decode_sec},
-            {"stage": "stt", "duration_sec": stt_sec},
-            {"stage": "llm", "duration_sec": llm_sec},
-            {"stage": "persist", "duration_sec": persist_sec},
-        ],
-        "total_duration_sec": total,
-        "rtf": rtf,
-        "peak_memory": [m.to_dict() for m in _peak_memory()],
-    }
+    else:
+        metrics = _build_metrics(decode_sec, stt_sec, llm_sec, 0.0, source.duration_sec)
 
     result = {
         "schema_version": CLI_OUTPUT_SCHEMA_VERSION,
         "command": "analyze",
-        "audio": {"path": str(Path(args.audio)), "duration_sec": audio_duration},
+        "audio": {"path": str(Path(args.audio)), "duration_sec": source.duration_sec},
         "stt_tier": stt_tier,
         "mock": bool(args.mock),
         "transcript": {
@@ -345,26 +346,18 @@ def cmd_analyze(args, out: IO, err: IO) -> int:
 
 
 def _persist_run(args, source, segments, stt_provenance, summarizer, summary,
-                 decode_sec, stt_sec, llm_sec) -> str:
-    """Persist an analyze run atomically to the normalized store. Returns run id."""
+                 decode_sec, stt_sec, llm_sec):
+    """Persist an analyze run atomically; return (run_id, metrics).
+
+    The run is committed first with NULL metrics (the persist duration cannot be
+    known until the write completes), then the measured persist duration is
+    written back via ``update_run_metrics`` so stored metrics include all four
+    stages and match the stdout metrics exactly.
+    """
     from localmind.store import ReferenceIntegrityError, Store
 
     stt_prov = _provenance_to_dict(stt_provenance) or {}
     status = "failed" if summary.get("status") == "failed" else "ok"
-    total = decode_sec + stt_sec + llm_sec  # persist measured by caller
-    audio_duration = source.duration_sec
-    metrics = {
-        "stages": [
-            {"stage": "decode", "duration_sec": decode_sec},
-            {"stage": "stt", "duration_sec": stt_sec},
-            {"stage": "llm", "duration_sec": llm_sec},
-            {"stage": "persist", "duration_sec": 0.0},  # filled post-hoc is not possible; record 0 here
-        ],
-        "total_duration_sec": total,
-        "rtf": (total / audio_duration) if audio_duration > 0 else 0.0,
-        "peak_memory": [m.to_dict() for m in _peak_memory()],
-    }
-
     stt_ref = {
         "model_id": stt_prov.get("model_id") or ("mock" if args.mock else args.tier),
         "kind": "whisper",
@@ -382,6 +375,7 @@ def _persist_run(args, source, segments, stt_provenance, summarizer, summary,
 
     store = Store(args.store)
     try:
+        t0 = time.perf_counter()
         run_id = store.put_full_run(
             audio={
                 "path": args.audio, "duration_sec": source.duration_sec,
@@ -398,13 +392,16 @@ def _persist_run(args, source, segments, stt_provenance, summarizer, summary,
                 "overlap_sec": args.overlap_sec,
                 "schema_version": CLI_OUTPUT_SCHEMA_VERSION,
                 "status": status,
-                "metrics": metrics,
+                "metrics": None,  # filled after measuring the persist duration
             },
             model_refs=[stt_ref, llm_ref],
             segments=segments,
             summary=summary,
         )
-        return run_id
+        persist_sec = time.perf_counter() - t0
+        metrics = _build_metrics(decode_sec, stt_sec, llm_sec, persist_sec, source.duration_sec)
+        store.update_run_metrics(run_id, metrics)
+        return run_id, metrics
     except ReferenceIntegrityError as exc:
         raise CliError(f"summary failed reference-integrity check: {exc}") from exc
     finally:
