@@ -6,17 +6,19 @@ sits on top of. It emits:
 * a versioned JSON final result on stdout, and
 * newline-delimited JSON (JSONL) progress events on stderr.
 
-Subcommands (the transcribe path is contract-tested now; ``summarize`` /
-``analyze`` arrive with the structured-summary work):
+Subcommands:
 
 * ``transcribe`` — decode + transcribe an audio file into timestamped segments.
+* ``summarize`` — summarize a transcript JSON into a versioned summary artifact.
+* ``analyze`` — run audio -> transcribe -> summarize in one pass.
 * ``benchmark`` — run the transcribe path with per-stage timing and emit a
   validated benchmark report.
 
 The transcribe backend is :class:`~localmind.stt.WhisperTranscriber` when
 ``mlx-whisper`` is installed and a model tier is provisioned; ``--mock`` uses
 :class:`~localmind.stt.MockTranscriber` so the contract is exercisable with no
-ML backend.
+ML backend. Likewise ``--mock`` uses :class:`~localmind.summary.MockSummaryLLM`
+for the summarize/analyze paths.
 """
 
 from __future__ import annotations

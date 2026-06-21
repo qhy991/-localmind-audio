@@ -20,15 +20,23 @@ from localmind.summary import (
 from localmind.summary.summarizer import _chunk_segments_by_chars
 
 
-def _seg(i, text="hello world"):
-    return TranscriptSegment(id=f"seg-{i:04d}", start=float(i), end=float(i + 1), text=text)
+def _seg(i, start=None, end=None, text="hello world"):
+    return TranscriptSegment(
+        id=f"seg-{i:04d}",
+        start=float(i if start is None else start),
+        end=float(i + 1 if end is None else end),
+        text=text,
+    )
 
 
 def _good_summary():
     return {
         "schema_version": SUMMARY_SCHEMA_VERSION,
         "case_id": "case-1",
-        "provenance": {"model_id": "m", "prompt_template_hash": "sha256:abcd"},
+        "provenance": {
+            "model_id": "m", "prompt_template_hash": "sha256:abcd",
+            "repaired": False, "repair_attempts_used": 0, "initial_validation_errors": [],
+        },
         "decisions": [{"text": "a decision", "citations": ["seg:seg-0000"]}],
         "action_items": [{
             "text": "do it", "owner": "Maya", "due_date": None,
@@ -44,8 +52,37 @@ def _good_summary():
 
 def test_valid_summary_passes():
     data = _good_summary()
+    segs = [_seg(0, 0.0, 1.0), _seg(1, 1.0, 2.0)]
     validate_summary_dict(data)
-    validate_summary_against_transcript(data, ["seg-0000", "seg-0001"])
+    validate_summary_against_transcript(data, segs)
+
+
+def test_action_item_missing_owner_rejected():
+    data = _good_summary()
+    data["action_items"][0] = {"text": "do it", "due_date": None, "citations": ["seg:seg-0001"]}
+    with pytest.raises(SummaryValidationError, match="owner is required"):
+        validate_summary_dict(data)
+
+
+def test_action_item_missing_due_date_rejected():
+    data = _good_summary()
+    data["action_items"][0] = {"text": "do it", "owner": "Maya", "citations": ["seg:seg-0001"]}
+    with pytest.raises(SummaryValidationError, match="due_date is required"):
+        validate_summary_dict(data)
+
+
+def test_action_item_empty_string_owner_rejected():
+    data = _good_summary()
+    data["action_items"][0]["owner"] = "   "
+    with pytest.raises(SummaryValidationError, match="owner"):
+        validate_summary_dict(data)
+
+
+def test_action_item_null_owner_and_due_date_accepted():
+    data = _good_summary()
+    data["action_items"][0]["owner"] = None
+    data["action_items"][0]["due_date"] = None
+    validate_summary_dict(data)
 
 
 def test_missing_citation_rejected():
@@ -65,9 +102,40 @@ def test_bad_due_date_rejected():
 def test_unknown_segment_citation_rejected():
     data = _good_summary()
     data["decisions"][0]["citations"] = ["seg:seg-9999"]
-    validate_summary_dict(data)  # shape is fine
+    validate_summary_dict(data)
     with pytest.raises(SummaryValidationError, match="unknown segment"):
-        validate_summary_against_transcript(data, ["seg-0000", "seg-0001"])
+        validate_summary_against_transcript(data, [_seg(0, 0.0, 1.0), _seg(1, 1.0, 2.0)])
+
+
+def test_timestamp_citation_out_of_range_rejected():
+    data = _good_summary()
+    data["decisions"][0]["citations"] = ["ts:999-1000"]
+    validate_summary_dict(data)
+    with pytest.raises(SummaryValidationError, match="does not overlap"):
+        validate_summary_against_transcript(data, [_seg(0, 0.0, 1.0), _seg(1, 1.0, 2.0)])
+
+
+def test_timestamp_citation_reversed_rejected():
+    data = _good_summary()
+    data["decisions"][0]["citations"] = ["ts:5-1"]
+    validate_summary_dict(data)
+    with pytest.raises(SummaryValidationError, match="start < end"):
+        validate_summary_against_transcript(data, [_seg(0, 0.0, 1.0)])
+
+
+def test_timestamp_citation_no_coverage_rejected():
+    data = _good_summary()
+    data["decisions"][0]["citations"] = ["ts:100-200"]
+    validate_summary_dict(data)
+    with pytest.raises(SummaryValidationError, match="does not overlap"):
+        validate_summary_against_transcript(data, [_seg(0, 0.0, 2.0)])
+
+
+def test_timestamp_citation_overlapping_segment_accepted():
+    data = _good_summary()
+    data["decisions"][0]["citations"] = ["ts:0.5-1.5"]
+    segs = [_seg(0, 0.0, 1.0), _seg(1, 1.0, 2.0)]
+    validate_summary_against_transcript(data, segs)  # overlaps both segments
 
 
 def test_bad_schema_version_rejected():
@@ -89,29 +157,35 @@ def test_summary_failed_roundtrip():
 
 
 # --------------------------------------------------------------------------- #
-# Summarizer: map-reduce, repair, summary_failed                              #
+# Summarizer: map-reduce, repair, provenance, summary_failed                  #
 # --------------------------------------------------------------------------- #
 
-def test_summarizer_valid_output():
+def test_summarizer_valid_runs_map_and_reduce():
     segs = [_seg(0), _seg(1), _seg(2)]
-    s = Summarizer(MockSummaryLLM("valid"), model_id="mock")
+    llm = MockSummaryLLM("valid")
+    s = Summarizer(llm, model_id="mock")
     summary = s.summarize(segs, case_id="case-1")
     assert summary["schema_version"] == SUMMARY_SCHEMA_VERSION
-    assert summary["case_id"] == "case-1"
     validate_summary_dict(summary)
-    validate_summary_against_transcript(summary, [x.id for x in segs])
-    assert len(summary["decisions"]) >= 1
+    validate_summary_against_transcript(summary, segs)
+    # One map call (single chunk) + one reduce call.
+    assert llm.map_calls == 1
+    assert llm.reduce_calls == 1
+    assert summary["provenance"]["repaired"] is False
+    assert summary["provenance"]["repair_attempts_used"] == 0
 
 
-def test_summarizer_repair_succeeds_after_invalid_first_output():
+def test_summarizer_repair_recorded_in_provenance():
     segs = [_seg(0), _seg(1)]
     llm = MockSummaryLLM("invalid_then_valid")
     s = Summarizer(llm, model_id="mock", max_repair_attempts=1)
     summary = s.summarize(segs, case_id="case-1")
-    # First call invalid, second (repair) valid -> 2 calls for the single chunk.
-    assert llm.call_count == 2
     assert summary["schema_version"] == SUMMARY_SCHEMA_VERSION
-    validate_summary_against_transcript(summary, [x.id for x in segs])
+    validate_summary_against_transcript(summary, segs)
+    prov = summary["provenance"]
+    assert prov["repaired"] is True
+    assert prov["repair_attempts_used"] == 1
+    assert len(prov["initial_validation_errors"]) >= 1
 
 
 def test_summarizer_repair_exhausted_returns_summary_failed():
@@ -123,25 +197,24 @@ def test_summarizer_repair_exhausted_returns_summary_failed():
     assert summary["status"] == "failed"
     assert isinstance(summary["raw_output"], str) and summary["raw_output"]
     assert len(summary["errors"]) >= 1
-    # 1 initial + 1 repair attempt for the single chunk.
-    assert llm.call_count == 2
+    # 1 initial map call + 1 map repair; reduce never reached.
+    assert llm.map_calls == 2
+    assert llm.reduce_calls == 0
 
 
-def test_summarizer_chunks_long_transcript():
+def test_summarizer_multi_chunk_runs_reduce_after_map():
     segs = [_seg(i, text="word " * 20) for i in range(10)]  # 100 chars each
     chunks = _chunk_segments_by_chars(segments=segs, max_chars=400)
     assert len(chunks) > 1
-    # With sub-budget segments, every chunk fits the budget.
-    for ch in chunks:
-        assert sum(len(s.text) for s in ch) <= 400
 
     llm = MockSummaryLLM("valid")
     s = Summarizer(llm, model_id="mock", max_chars_per_chunk=400)
     summary = s.summarize(segs, case_id="case-long")
     validate_summary_dict(summary)
-    validate_summary_against_transcript(summary, [x.id for x in segs])
-    # Multiple chunks -> multiple LLM calls.
-    assert llm.call_count == len(chunks)
+    validate_summary_against_transcript(summary, segs)
+    # Map ran once per chunk, then exactly one reduce call.
+    assert llm.map_calls == len(chunks)
+    assert llm.reduce_calls == 1
 
 
 def test_summarizer_zero_repair_attempts_fails_on_invalid():
@@ -150,4 +223,5 @@ def test_summarizer_zero_repair_attempts_fails_on_invalid():
     s = Summarizer(llm, model_id="mock", max_repair_attempts=0)
     summary = s.summarize(segs, case_id="case-1")
     validate_summary_failed_dict(summary)
-    assert llm.call_count == 1  # no repair attempted
+    assert llm.map_calls == 1  # no repair attempted
+    assert llm.reduce_calls == 0

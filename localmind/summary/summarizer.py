@@ -1,15 +1,22 @@
 """Structured-summary generation: map-reduce over transcript chunks.
 
-* :class:`SummaryLLM` — abstract local-LLM interface (a string prompt in, a
-  string out). The real adapter (mlx-lm / llama.cpp) is added when the LLM
-  backend is provisioned; :class:`MockSummaryLLM` makes the pipeline testable
-  with no backend.
-* :class:`Summarizer` — chunks a transcript by a character budget, asks the LLM
-  for a partial summary per chunk, validates each partial's sections and
-  citations against the chunk's real segment ids, merges them, and validates the
-  final summary against all segment ids. Invalid output gets exactly one bounded
-  repair attempt; if repair is exhausted, a ``summary_failed`` artifact is
-  returned with the raw output and errors — never a fabricated summary.
+Pipeline:
+
+1. **Map** — chunk the transcript by a character budget; ask the LLM for a
+   partial summary per chunk; validate each partial's sections and citations
+   against that chunk's real segments.
+2. **Reduce** — ask the LLM once over the validated partials for the final
+   sections; validate against the full transcript.
+
+Both map and reduce outputs get exactly one bounded repair attempt; if repair is
+exhausted, a ``summary_failed`` artifact is returned with the raw output and
+errors — never a fabricated summary. Successful repair is recorded in the
+summary provenance (``repaired``, ``repair_attempts_used``,
+``initial_validation_errors``).
+
+:class:`SummaryLLM` is the abstract local-LLM interface; :class:`MockSummaryLLM`
+makes the pipeline testable with no backend and distinguishes map vs reduce
+calls so tests can assert the reduce step runs.
 """
 
 from __future__ import annotations
@@ -44,14 +51,14 @@ class SummaryLLM(ABC):
 class MockSummaryLLM(SummaryLLM):
     """Deterministic fake LLM for tests.
 
-    Modes:
-      * ``"valid"`` — always returns a valid partial summary citing the segment
-        ids found in the prompt.
-      * ``"invalid_then_valid"`` — the first call returns an invalid partial
-        (a decision with no citation); subsequent calls return a valid one
-        (exercises the repair path).
-      * ``"always_invalid"`` — always returns an invalid partial (exercises
-        repair exhaustion -> summary_failed).
+    A reduce prompt is detected by a leading ``REDUCE`` marker. Modes:
+      * ``"valid"`` — always returns valid sections citing the segment ids found
+        in the prompt.
+      * ``"invalid_then_valid"`` — the first call returns invalid sections (a
+        decision with no citation); later calls return valid ones (exercises
+        repair at the map or reduce step).
+      * ``"always_invalid"`` — always returns invalid sections (exercises repair
+        exhaustion -> summary_failed).
     """
 
     def __init__(self, mode: str = "valid"):
@@ -59,26 +66,25 @@ class MockSummaryLLM(SummaryLLM):
             raise ValueError(f"unknown MockSummaryLLM mode: {mode!r}")
         self.mode = mode
         self.call_count = 0
+        self.map_calls = 0
+        self.reduce_calls = 0
 
     def generate(self, prompt: str) -> str:
         self.call_count += 1
+        if prompt.startswith("REDUCE"):
+            self.reduce_calls += 1
+        else:
+            self.map_calls += 1
+
         ids = _SEG_ID_RE.findall(prompt)
         if not ids:
             ids = ["seg-0000"]
         first, last = ids[0], ids[-1]
 
         if self.mode == "always_invalid":
-            return json.dumps({
-                "decisions": [{"text": "a decision", "citations": []}],
-                "action_items": [],
-                "open_questions": [],
-            })
+            return self._invalid()
         if self.mode == "invalid_then_valid" and self.call_count == 1:
-            return json.dumps({
-                "decisions": [{"text": "a decision", "citations": []}],
-                "action_items": [],
-                "open_questions": [],
-            })
+            return self._invalid()
 
         return json.dumps({
             "decisions": [{"text": "a decision was made", "citations": [f"seg:{first}"]}],
@@ -88,17 +94,21 @@ class MockSummaryLLM(SummaryLLM):
                 "due_date": None,
                 "citations": [f"seg:{last}"],
             }],
-            "open_questions": [{
-                "text": "an open question",
-                "citations": [f"seg:{first}"],
-            }],
+            "open_questions": [{"text": "an open question", "citations": [f"seg:{first}"]}],
+        })
+
+    @staticmethod
+    def _invalid() -> str:
+        return json.dumps({
+            "decisions": [{"text": "a decision", "citations": []}],
+            "action_items": [],
+            "open_questions": [],
         })
 
 
 def _chunk_segments_by_chars(
     segments: List[TranscriptSegment], max_chars: int
 ) -> List[List[TranscriptSegment]]:
-    """Group consecutive segments so each chunk's text fits the char budget."""
     chunks: List[List[TranscriptSegment]] = []
     current: List[TranscriptSegment] = []
     used = 0
@@ -115,7 +125,7 @@ def _chunk_segments_by_chars(
     return chunks or [list(segments)]
 
 
-def _build_prompt(chunk: List[TranscriptSegment]) -> str:
+def _build_map_prompt(chunk: List[TranscriptSegment]) -> str:
     lines = ["Transcript segments (id | start-end | text):"]
     for s in chunk:
         lines.append(f"{s.id} | {s.start:.3f}-{s.end:.3f} | {s.text}")
@@ -129,17 +139,27 @@ def _build_prompt(chunk: List[TranscriptSegment]) -> str:
     return "\n".join(lines)
 
 
+def _build_reduce_prompt(partials: List[Dict], all_segments: List[TranscriptSegment]) -> str:
+    lines = ["REDUCE"]
+    lines.append("Combine these partial summaries into one final JSON object with keys "
+                 "decisions, action_items, open_questions. Resolve duplicates and keep "
+                 "citations as 'seg:<id>' referencing only these segment ids:")
+    lines.append(", ".join(s.id for s in all_segments))
+    lines.append("Partials:")
+    lines.append(json.dumps(partials))
+    lines.append("Output ONLY the final JSON object.")
+    return "\n".join(lines)
+
+
 def _parse_and_validate_sections(
-    raw: str, chunk_ids: List[str]
+    raw: str, segments
 ) -> Tuple[Optional[Dict], List[str]]:
-    """Parse raw LLM output and validate its sections + citations. Returns
-    (parsed_sections, errors)."""
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         return None, [f"output is not valid JSON: {exc}"]
     try:
-        validate_summary_sections(data, chunk_ids)
+        validate_summary_sections(data, segments)
     except SummaryValidationError as exc:
         return None, [str(exc)]
     return data, []
@@ -163,26 +183,36 @@ class Summarizer:
         self.model_id = model_id
         self.prompt_template = prompt_template
         self.prompt_template_hash = "sha256:" + hashlib.sha256(
-            (prompt_template or _build_prompt.__doc__ or "").encode("utf-8")
+            (prompt_template or "localmind-summary").encode("utf-8")
         ).hexdigest()[:12]
         self.max_chars_per_chunk = max_chars_per_chunk
         self.max_repair_attempts = max_repair_attempts
 
     def summarize(self, segments: List[TranscriptSegment], case_id: str) -> Dict:
-        all_ids = [s.id for s in segments]
+        self._repaired = False
+        self._repair_used = 0
+        self._initial_errors: List[str] = []
+
         chunks = _chunk_segments_by_chars(segments, self.max_chars_per_chunk)
 
-        merged = {"decisions": [], "action_items": [], "open_questions": []}
+        # Map: per-chunk partials.
+        partials: List[Dict] = []
         for chunk in chunks:
-            partial, raw, errors = self._generate_chunk(chunk)
+            partial, raw, errors = self._generate_with_repair(_build_map_prompt(chunk), chunk)
             if partial is None:
-                return build_summary_failed(
-                    raw, errors, case_id=case_id,
-                    model_id=self.model_id,
-                    prompt_template_hash=self.prompt_template_hash,
-                )
-            for key in merged:
-                merged[key].extend(partial.get(key, []))
+                return self._failed(raw, errors, case_id)
+            partials.append({
+                "decisions": partial.get("decisions", []),
+                "action_items": partial.get("action_items", []),
+                "open_questions": partial.get("open_questions", []),
+            })
+
+        # Reduce: one LLM call over the partials for the final sections.
+        reduced, raw, errors = self._generate_with_repair(
+            _build_reduce_prompt(partials, segments), segments
+        )
+        if reduced is None:
+            return self._failed(raw, errors, case_id)
 
         final = {
             "schema_version": SUMMARY_SCHEMA_VERSION,
@@ -190,36 +220,37 @@ class Summarizer:
             "provenance": {
                 "model_id": self.model_id,
                 "prompt_template_hash": self.prompt_template_hash,
+                "repaired": self._repaired,
+                "repair_attempts_used": self._repair_used,
+                "initial_validation_errors": list(self._initial_errors),
             },
-            **merged,
+            "decisions": reduced.get("decisions", []),
+            "action_items": reduced.get("action_items", []),
+            "open_questions": reduced.get("open_questions", []),
         }
         try:
             validate_summary_dict(final)
-            validate_summary_against_transcript(final, all_ids)
+            validate_summary_against_transcript(final, segments)
         except SummaryValidationError as exc:
-            return build_summary_failed(
-                json.dumps(final), [str(exc)], case_id=case_id,
-                model_id=self.model_id,
-                prompt_template_hash=self.prompt_template_hash,
-            )
+            return self._failed(json.dumps(final), [str(exc)], case_id)
         return final
 
-    def _generate_chunk(
-        self, chunk: List[TranscriptSegment]
+    def _generate_with_repair(
+        self, prompt: str, segments
     ) -> Tuple[Optional[Dict], str, List[str]]:
-        """Generate + validate one chunk's partial summary with bounded repair.
+        """Generate + validate one output (map or reduce) with bounded repair.
 
-        Returns (partial_or_None, last_raw_output, errors). errors is non-empty
-        only when partial is None.
+        Returns (parsed_or_None, last_raw_output, errors). On success errors is
+        empty; on exhaustion parsed is None and errors is non-empty. Repair
+        metadata is recorded on the summarizer.
         """
-        chunk_ids = [s.id for s in chunk]
-        prompt = _build_prompt(chunk)
         raw = self.llm.generate(prompt)
-        partial, errors = _parse_and_validate_sections(raw, chunk_ids)
-        if partial is not None:
-            return partial, raw, []
+        parsed, errors = _parse_and_validate_sections(raw, segments)
+        if parsed is not None:
+            return parsed, raw, []
 
-        # Bounded repair: re-prompt with the validation error, up to the limit.
+        initial_errors = list(errors)
+        attempts_used = 0
         for _ in range(self.max_repair_attempts):
             repair_prompt = (
                 prompt + "\n\nYour previous output was invalid: "
@@ -227,8 +258,26 @@ class Summarizer:
                 + "\nProduce a valid JSON object now."
             )
             raw = self.llm.generate(repair_prompt)
-            partial, errors = _parse_and_validate_sections(raw, chunk_ids)
-            if partial is not None:
-                return partial, raw, []
+            attempts_used += 1
+            parsed, errors = _parse_and_validate_sections(raw, segments)
+            if parsed is not None:
+                self._record_repair(initial_errors, attempts_used)
+                return parsed, raw, []
 
+        self._record_repair(initial_errors, attempts_used or self.max_repair_attempts)
         return None, raw, errors or ["repair exhausted"]
+
+    def _record_repair(self, initial_errors: List[str], attempts: int) -> None:
+        self._repaired = True
+        self._repair_used += attempts
+        if not self._initial_errors:
+            self._initial_errors = list(initial_errors)
+
+    def _failed(self, raw: str, errors: List[str], case_id: str) -> Dict:
+        return build_summary_failed(
+            raw, errors, case_id=case_id,
+            model_id=self.model_id,
+            prompt_template_hash=self.prompt_template_hash,
+            repaired=self._repaired,
+            repair_attempts_used=self._repair_used,
+        )
