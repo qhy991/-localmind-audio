@@ -1,5 +1,5 @@
 {
-  "$comment": "Example shape for a structured summary artifact (AC-3 / AC-4). This is the target output of the LLM analysis stage: a versioned JSON object with decisions, action_items (owner + due_date, both nullable), open_questions, and citations back to transcript segment IDs. Used as the expected-output example for benchmarking summary quality.",
+  "$comment": "Example shape for a structured summary artifact (structured summary). This is the target output of the LLM analysis stage: a versioned JSON object with decisions, action_items (owner + due_date, both nullable), open_questions, and citations back to transcript segment IDs. Used as the expected-output example for benchmarking summary quality.",
   "schema_version": "1",
   "case_id": "bm-10min",
   "decisions": [

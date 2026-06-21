@@ -1,6 +1,6 @@
 """Benchmark harness: fixture generation and machine-readable report schema.
 
-This package supports acceptance criteria AC-2 and AC-6 by providing:
+This package supports benchmark fixture generation and report validation by providing:
 
 * deterministic synthetic-audio fixtures for small test cases,
 * descriptors for the 10/30/60-minute benchmark cases (real audio is provisioned
@@ -13,7 +13,11 @@ This package supports acceptance criteria AC-2 and AC-6 by providing:
 from localmind.bench.fixtures import (
     BENCHMARK_CASES,
     BenchmarkCase,
+    FixtureNotProvisionedError,
+    fixture_path,
     generate_synthetic_wav,
+    is_fixture_provisioned,
+    require_fixture,
 )
 from localmind.bench.report import (
     REPORT_SCHEMA_VERSION,
@@ -25,7 +29,11 @@ from localmind.bench.report import (
 __all__ = [
     "BENCHMARK_CASES",
     "BenchmarkCase",
+    "FixtureNotProvisionedError",
+    "fixture_path",
     "generate_synthetic_wav",
+    "is_fixture_provisioned",
+    "require_fixture",
     "REPORT_SCHEMA_VERSION",
     "BenchmarkReport",
     "StageTiming",

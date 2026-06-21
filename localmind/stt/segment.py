@@ -1,7 +1,7 @@
-"""Transcript segment model and validation (AC-2).
+"""Transcript segment model and validation.
 
 A transcript is an ordered list of timestamped segments. Validation enforces the
-AC-2 invariants: segments are non-empty, span real time (strictly positive
+Transcript invariants: segments are non-empty, span real time (strictly positive
 length), are bounded by the audio duration, and have monotonically
 non-decreasing start times. A "flat untimed" transcript (segments with no real
 timestamps, e.g. ``start == end == 0``) is rejected because zero-length segments
@@ -33,7 +33,7 @@ class TranscriptSegment:
 def validate_segments(
     segments: List[TranscriptSegment], audio_duration_sec: float
 ) -> List[TranscriptSegment]:
-    """Validate a transcript against AC-2 invariants.
+    """Validate a transcript against the segment invariants.
 
     Returns the segments unchanged on success; raises SegmentValidationError
     on any violation.

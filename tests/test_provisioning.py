@@ -1,4 +1,4 @@
-"""Acceptance tests for AC-9: offline model provisioning with integrity verification.
+"""Tests for offline model provisioning with integrity verification.
 
 Every test is hermetic: dummy weights and manifests are generated in ``tmp_path``
 and no network is used. The "no download at runtime" guarantee is asserted by
@@ -102,7 +102,7 @@ def test_verify_all_reports_every_entry_ok(tmp_path):
 
 
 def test_require_model_never_touches_the_network(tmp_path, monkeypatch):
-    """AC-9 runtime guarantee: provisioning reads local files only."""
+    """Runtime guarantee: provisioning reads local files only."""
     model_dir = tmp_path / "models"
     content = b"local-only-weights" * 5
     _write_weight(model_dir, "whisper-small.mlmodel", content)
@@ -248,7 +248,7 @@ def test_corrupt_manifest_json(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_validation_does_not_depend_on_jsonschema(monkeypatch):
-    """AC-9: manifest validation must work without the jsonschema package."""
+    """Manifest validation must work without the jsonschema package."""
     import localmind.provisioning.manifest as manifest_mod
 
     # Even if jsonschema were present, our validator must not rely on it.

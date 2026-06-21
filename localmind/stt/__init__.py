@@ -1,30 +1,47 @@
-"""Speech-to-text framework: segment model, chunking, tier selection, transcribers.
+"""Speech-to-text framework: segment model, bounded chunking, tier selection, transcribers.
 
-The real Whisper inference adapter (`WhisperTranscriber`) needs `mlx-whisper`
-plus provisioned weights and is finalized in a later milestone; this package
-delivers the dependency-free, fully testable framework now: the transcript
-segment model and validator (AC-2), bounded audio chunking (AC-2.1), model-tier
-selection through the provisioner (missing tier fast-fails without download),
-and a `MockTranscriber` for deterministic tests.
+The transcription backend (`WhisperTranscriber`) runs `mlx-whisper` against a
+locally provisioned model; when `mlx-whisper` is not installed it raises a clear
+error rather than silently degrading. This package also provides the transcript
+segment model and validator, bounded audio chunking (windowed sources so peak
+audio-buffer memory does not scale with file length), model-tier resolution
+through the provisioner (a missing tier fast-fails without any download), and a
+`MockTranscriber` for deterministic tests.
 """
 
-from localmind.stt.chunking import MAX_UNCHUNKED_SEC, ChunkingConfig, chunk_audio
+from localmind.stt.chunking import (
+    MAX_UNCHUNKED_SEC,
+    ArrayAudioSource,
+    AudioChunk,
+    AudioSource,
+    ChunkingConfig,
+    WavAudioSource,
+    chunk_audio,
+    iter_audio_chunks,
+)
 from localmind.stt.segment import TranscriptSegment, validate_segments
 from localmind.stt.transcriber import (
     MockTranscriber,
+    ResolvedTier,
     Transcriber,
     WhisperTranscriber,
-    select_tier,
+    resolve_tier,
 )
 
 __all__ = [
     "MAX_UNCHUNKED_SEC",
+    "ArrayAudioSource",
+    "AudioChunk",
+    "AudioSource",
     "ChunkingConfig",
+    "WavAudioSource",
     "chunk_audio",
+    "iter_audio_chunks",
     "TranscriptSegment",
     "validate_segments",
     "MockTranscriber",
+    "ResolvedTier",
     "Transcriber",
     "WhisperTranscriber",
-    "select_tier",
+    "resolve_tier",
 ]

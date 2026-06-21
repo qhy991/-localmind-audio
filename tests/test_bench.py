@@ -1,4 +1,4 @@
-"""Acceptance tests for task2: benchmark fixture generation and report schema (AC-2/AC-6 support)."""
+"""Tests for benchmark fixture generation and report schema."""
 
 from __future__ import annotations
 
@@ -10,7 +10,13 @@ import pytest
 import wave
 
 from localmind.bench import BENCHMARK_CASES, BenchmarkReport
-from localmind.bench.fixtures import BenchmarkCase, generate_synthetic_wav
+from localmind.bench.fixtures import (
+    BenchmarkCase,
+    FixtureNotProvisionedError,
+    generate_synthetic_wav,
+    is_fixture_provisioned,
+    require_fixture,
+)
 from localmind.bench.report import (
     REPORT_SCHEMA_VERSION,
     PeakMemory,
@@ -20,7 +26,7 @@ from localmind.bench.report import (
 
 
 # --------------------------------------------------------------------------- #
-# Fixtures (AC-2 support)                                                      #
+# Fixtures                                                                      #
 # --------------------------------------------------------------------------- #
 
 def test_benchmark_cases_cover_10_30_60_minutes():
@@ -49,8 +55,24 @@ def test_generate_synthetic_wav_is_deterministic(tmp_path):
     assert a.read_bytes() == b.read_bytes()
 
 
+def test_require_fixture_fails_clearly_when_missing(tmp_path):
+    case = BENCHMARK_CASES[0]
+    assert is_fixture_provisioned(tmp_path, case) is False
+    with pytest.raises(FixtureNotProvisionedError, match=case.case_id):
+        require_fixture(tmp_path, case)
+
+
+def test_require_fixture_returns_path_when_present(tmp_path):
+    case = BENCHMARK_CASES[0]
+    p = tmp_path / case.audio_rel_path
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"fake audio bytes")
+    assert is_fixture_provisioned(tmp_path, case) is True
+    assert require_fixture(tmp_path, case) == p
+
+
 # --------------------------------------------------------------------------- #
-# Report schema (AC-6)                                                         #
+# Report schema                                                                 #
 # --------------------------------------------------------------------------- #
 
 def _good_report_dict():
@@ -119,6 +141,49 @@ def test_report_wrong_schema_version_rejected():
     data = _good_report_dict()
     data["schema_version"] = "999"
     with pytest.raises(ValueError, match="schema_version"):
+        validate_report_dict(data)
+
+
+def test_report_missing_total_duration_rejected():
+    data = _good_report_dict()
+    del data["total_duration_sec"]
+    with pytest.raises(ValueError, match="total_duration_sec"):
+        validate_report_dict(data)
+
+
+def test_report_negative_total_duration_rejected():
+    data = _good_report_dict()
+    data["total_duration_sec"] = -1.0
+    with pytest.raises(ValueError, match="total_duration_sec"):
+        validate_report_dict(data)
+
+
+def test_report_missing_aspirational_targets_rejected():
+    data = _good_report_dict()
+    del data["aspirational_targets"]
+    with pytest.raises(ValueError, match="aspirational_targets"):
+        validate_report_dict(data)
+
+
+def test_report_aspirational_targets_missing_key_rejected():
+    data = _good_report_dict()
+    data["aspirational_targets"] = {"peak_mem_gb": 6.0}  # missing rtf
+    with pytest.raises(ValueError, match="rtf"):
+        validate_report_dict(data)
+
+
+def test_report_aspirational_targets_non_numeric_rejected():
+    data = _good_report_dict()
+    data["aspirational_targets"] = {"peak_mem_gb": "6", "rtf": 0.08}
+    with pytest.raises(ValueError, match="peak_mem_gb"):
+        validate_report_dict(data)
+
+
+def test_report_aspirational_targets_drift_rejected():
+    """Schema v1 pins the plan's targets; a report claiming a different bar is rejected."""
+    data = _good_report_dict()
+    data["aspirational_targets"] = {"peak_mem_gb": 8.0, "rtf": 0.08}
+    with pytest.raises(ValueError, match="peak_mem_gb"):
         validate_report_dict(data)
 
 

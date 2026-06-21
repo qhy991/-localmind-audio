@@ -1,5 +1,5 @@
 {
-  "$comment": "Expected-output shape for a benchmark transcript (AC-2 tolerance). Real expected transcripts for the 10/30/60-min cases are generated once from the baseline whisper tier and stored alongside the provisioned audio (out-of-band); this file documents their shape. Segments are ordered, timestamped, monotonic non-decreasing, and bounded by audio duration. Tolerance is measured at the segment-boundary and word-error-rate level, not bit-exact.",
+  "$comment": "Expected-output shape for a benchmark transcript (transcript tolerance). Real expected transcripts for the 10/30/60-min cases are generated once from the baseline whisper tier and stored alongside the provisioned audio (out-of-band); this file documents their shape. Segments are ordered, timestamped, monotonic non-decreasing, and bounded by audio duration. Tolerance is measured at the segment-boundary and word-error-rate level, not bit-exact.",
   "case_id": "bm-10min",
   "model_tier": "whisper-small",
   "audio_duration_sec": 600.0,

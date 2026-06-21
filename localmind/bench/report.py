@@ -1,4 +1,4 @@
-"""Versioned, machine-readable benchmark report schema (AC-6).
+"""Versioned, machine-readable benchmark report schema.
 
 A benchmark report records the per-stage timing, overall RTF, and peak memory
 (CPU RSS vs GPU allocation, each with an explicit measurement method) for a run
@@ -42,7 +42,7 @@ class PeakMemory:
     """Peak memory measurement, split by domain with an explicit method.
 
     ``method`` states how the value was measured so a reader knows whether it is
-    CPU RSS, Metal/GPU allocation, etc. — required by AC-6's negative test.
+    CPU RSS, Metal/GPU allocation, etc. — required by the report validator's negative tests.
     """
 
     bytes: int
@@ -106,9 +106,48 @@ def validate_report_dict(data: Dict) -> None:
             f"expected {REPORT_SCHEMA_VERSION!r}"
         )
 
-    for req in ("run_id", "case_id", "audio_duration_sec", "stages", "rtf", "peak_memory"):
+    for req in (
+        "run_id",
+        "case_id",
+        "audio_duration_sec",
+        "stages",
+        "rtf",
+        "peak_memory",
+        "total_duration_sec",
+        "aspirational_targets",
+    ):
         if req not in data:
             raise ValueError(f"report missing required field: {req}")
+
+    total = data["total_duration_sec"]
+    if not isinstance(total, (int, float)) or isinstance(total, bool) or total < 0:
+        raise ValueError(
+            f"total_duration_sec must be a non-negative number, got {total!r}"
+        )
+
+    targets = data["aspirational_targets"]
+    if not isinstance(targets, dict):
+        raise ValueError("aspirational_targets must be an object")
+    for key in ("peak_mem_gb", "rtf"):
+        if key not in targets:
+            raise ValueError(f"aspirational_targets missing required key: {key}")
+        val = targets[key]
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            raise ValueError(
+                f"aspirational_targets.{key} must be a number, got {val!r}"
+            )
+    # For schema version 1 the plan pins these targets; reject drift so a report
+    # cannot silently claim a different bar than the one the plan measures against.
+    if targets["peak_mem_gb"] != ASPIRATIONAL_PEAK_MEM_GB:
+        raise ValueError(
+            f"aspirational_targets.peak_mem_gb must be {ASPIRATIONAL_PEAK_MEM_GB} "
+            f"for schema version 1, got {targets['peak_mem_gb']!r}"
+        )
+    if targets["rtf"] != ASPIRATIONAL_RTF:
+        raise ValueError(
+            f"aspirational_targets.rtf must be {ASPIRATIONAL_RTF} "
+            f"for schema version 1, got {targets['rtf']!r}"
+        )
 
     stages = data["stages"]
     if not isinstance(stages, list) or not stages:
@@ -129,7 +168,7 @@ def validate_report_dict(data: Dict) -> None:
             s.get("duration_sec"), bool
         ):
             raise ValueError(f"stages[{i}].duration_sec must be a number")
-    # AC-6 requires per-stage breakdown: every valid stage must be present.
+    # The report requires a per-stage breakdown: every valid stage must be present.
     missing = set(_VALID_STAGES) - seen_stages
     if missing:
         raise ValueError(f"report missing stage(s): {sorted(missing)}")
@@ -152,7 +191,7 @@ def validate_report_dict(data: Dict) -> None:
                 f"peak_memory[{i}].method must be one of {sorted(_VALID_MEM_METHODS)}, "
                 f"got {m.get('method')!r}"
             )
-    # AC-6 requires distinguishing CPU RSS vs GPU allocation.
+    # The report must distinguish CPU RSS vs GPU allocation.
     domains = {m["domain"] for m in pm}
     if "cpu" not in domains or "gpu" not in domains:
         raise ValueError("report 'peak_memory' must include both 'cpu' and 'gpu' domains")

@@ -105,3 +105,33 @@ def fixture_digest(path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+class FixtureNotProvisionedError(Exception):
+    """A required benchmark fixture audio file is not present locally."""
+
+
+def fixture_path(fixtures_dir, case: "BenchmarkCase") -> Path:
+    """Resolve where a benchmark case's audio is expected on disk."""
+    return Path(fixtures_dir) / case.audio_rel_path
+
+
+def is_fixture_provisioned(fixtures_dir, case: "BenchmarkCase") -> bool:
+    """True if the benchmark case's audio file exists locally."""
+    return fixture_path(fixtures_dir, case).is_file()
+
+
+def require_fixture(fixtures_dir, case: "BenchmarkCase") -> Path:
+    """Return the path to a provisioned benchmark fixture, or fail clearly.
+
+    Real 10/30/60-minute audio is provisioned out-of-band (see
+    ``docs/benchmark.md``). A benchmark run calls this so a missing fixture
+    fails fast with an explicit message rather than a silent skip or a crash.
+    """
+    p = fixture_path(fixtures_dir, case)
+    if not p.is_file():
+        raise FixtureNotProvisionedError(
+            f"benchmark fixture not provisioned: {case.case_id} expected at {p}; "
+            f"provision it out-of-band (see docs/benchmark.md)"
+        )
+    return p

@@ -1,4 +1,4 @@
-"""Acceptance tests for AC-1: decode local audio to normalized PCM.
+"""Tests for decoding local audio to normalized PCM.
 
 WAV paths are fully exercised (stdlib backend, no external deps). Compressed
 formats (m4a/mp3) are decoded via the ffmpeg backend, which resolves a binary
