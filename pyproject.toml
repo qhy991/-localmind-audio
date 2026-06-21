@@ -18,7 +18,7 @@ ml = [
 ]
 dev = [
     "pytest>=8",
-    "jsonschema>=4",
+    "imageio-ffmpeg>=0.5",  # provides a local ffmpeg binary for m4a/mp3 decode tests
 ]
 
 [tool.setuptools.packages.find]

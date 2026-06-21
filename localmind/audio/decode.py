@@ -27,7 +27,7 @@ import subprocess
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -36,6 +36,14 @@ from localmind.audio.errors import (
     DecoderUnavailableError,
     UnsupportedFormatError,
 )
+
+# Optional: imageio-ffmpeg ships a static ffmpeg binary, so compressed-format
+# decoding works in dev/test environments without a system ffmpeg install. The
+# product provisions ffmpeg out-of-band; this fallback keeps tests hermetic.
+try:
+    import imageio_ffmpeg
+except Exception:  # pragma: no cover - optional dependency
+    imageio_ffmpeg = None
 
 TARGET_SAMPLE_RATE = 16000
 
@@ -173,18 +181,32 @@ def _resample_linear(samples: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray
 # ffmpeg backend (m4a / mp3 / aac)                                            #
 # --------------------------------------------------------------------------- #
 
+def _ffmpeg_exe() -> Optional[str]:
+    """Resolve an ffmpeg binary: system ffmpeg first, then the bundled imageio-ffmpeg one."""
+    system = shutil.which("ffmpeg")
+    if system:
+        return system
+    if imageio_ffmpeg is not None:
+        try:
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            return None
+    return None
+
+
 def _ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+    return _ffmpeg_exe() is not None
 
 
 def _decode_via_ffmpeg(path: Path, target_rate: int, fmt: str) -> DecodedAudio:
-    if not _ffmpeg_available():
+    exe = _ffmpeg_exe()
+    if exe is None:
         raise DecoderUnavailableError(
-            f"ffmpeg is not installed; cannot decode .{fmt}. "
-            f"Install ffmpeg (out-of-band) to enable .{fmt} decoding. File: {path}"
+            f"ffmpeg is not available; cannot decode .{fmt}. "
+            f"Install ffmpeg (out-of-band) or the imageio-ffmpeg package. File: {path}"
         )
     cmd = [
-        "ffmpeg",
+        exe,
         "-loglevel", "error",
         "-i", str(path),
         "-f", "f32le",

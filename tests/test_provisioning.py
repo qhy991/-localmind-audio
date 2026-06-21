@@ -241,3 +241,131 @@ def test_corrupt_manifest_json(tmp_path):
     (model_dir / "models.json").write_text("{ not valid json", encoding="utf-8")
     with pytest.raises(ManifestError):
         Provisioner(model_dir).load_manifest()
+
+
+# --------------------------------------------------------------------------- #
+# Round 1 hardening: deterministic stdlib validation, path confinement, dup id #
+# --------------------------------------------------------------------------- #
+
+def test_validation_does_not_depend_on_jsonschema(monkeypatch):
+    """AC-9: manifest validation must work without the jsonschema package."""
+    import localmind.provisioning.manifest as manifest_mod
+
+    # Even if jsonschema were present, our validator must not rely on it.
+    monkeypatch.setattr(manifest_mod, "jsonschema", None, raising=False)
+    entry = _entry("w", "w.bin", b"data" * 4)
+    data = {"schema_version": MANIFEST_SCHEMA_VERSION, "models": [entry]}
+    # A valid manifest validates cleanly despite jsonschema being absent.
+    manifest_mod.validate_manifest_dict(data)
+
+
+def test_bad_kind_is_rejected_without_jsonschema(monkeypatch):
+    import localmind.provisioning.manifest as manifest_mod
+    monkeypatch.setattr(manifest_mod, "jsonschema", None, raising=False)
+    entry = _entry("w", "w.bin", b"data" * 4)
+    entry["kind"] = "bad"
+    with pytest.raises(ManifestError, match="kind"):
+        manifest_mod.validate_manifest_dict(
+            {"schema_version": MANIFEST_SCHEMA_VERSION, "models": [entry]}
+        )
+
+
+def test_non_list_models_rejected(monkeypatch):
+    import localmind.provisioning.manifest as manifest_mod
+    monkeypatch.setattr(manifest_mod, "jsonschema", None, raising=False)
+    with pytest.raises(ManifestError, match="array"):
+        manifest_mod.validate_manifest_dict(
+            {"schema_version": MANIFEST_SCHEMA_VERSION, "models": {"not": "a list"}}
+        )
+
+
+def test_invalid_size_bytes_rejected(monkeypatch):
+    import localmind.provisioning.manifest as manifest_mod
+    monkeypatch.setattr(manifest_mod, "jsonschema", None, raising=False)
+    for bad in (-1, True, "64", 1.5):
+        entry = _entry("w", "w.bin", b"data" * 4)
+        entry["size_bytes"] = bad
+        with pytest.raises(ManifestError, match="size_bytes"):
+            manifest_mod.validate_manifest_dict(
+                {"schema_version": MANIFEST_SCHEMA_VERSION, "models": [entry]}
+            )
+
+
+def test_bad_sha_pattern_rejected_without_jsonschema(monkeypatch):
+    import localmind.provisioning.manifest as manifest_mod
+    monkeypatch.setattr(manifest_mod, "jsonschema", None, raising=False)
+    entry = _entry("w", "w.bin", b"data" * 4)
+    entry["sha256"] = "ZZ" * 32  # 64 chars but not hex
+    with pytest.raises(ManifestError, match="sha256"):
+        manifest_mod.validate_manifest_dict(
+            {"schema_version": MANIFEST_SCHEMA_VERSION, "models": [entry]}
+        )
+
+
+def test_duplicate_model_id_rejected(tmp_path):
+    model_dir = tmp_path / "models"
+    content = b"x" * 4
+    _write_weight(model_dir, "a.bin", content)
+    entry = _entry("dup", "a.bin", content)
+    _write_manifest(model_dir, [entry, dict(entry)])  # same id twice
+    with pytest.raises(ManifestError, match="duplicate"):
+        Provisioner(model_dir).load_manifest()
+
+
+def test_absolute_weight_path_rejected_at_load(tmp_path):
+    model_dir = tmp_path / "models"
+    content = b"x" * 4
+    entry = _entry("w", "/etc/passwd", content)  # absolute path
+    _write_manifest(model_dir, [entry])
+    with pytest.raises(ManifestError, match="absolute"):
+        Provisioner(model_dir).load_manifest()
+
+
+def test_traversal_weight_path_rejected_at_load(tmp_path):
+    model_dir = tmp_path / "models"
+    content = b"x" * 4
+    entry = _entry("w", "../escape.bin", content)  # escapes model dir
+    _write_manifest(model_dir, [entry])
+    with pytest.raises(ManifestError, match="traverse"):
+        Provisioner(model_dir).load_manifest()
+
+
+def test_require_model_rejects_traversal_entry_defense_in_depth(tmp_path):
+    """A hand-built entry with a traversal path is rejected even past validation."""
+    model_dir = tmp_path / "models"
+    content = b"x" * 4
+    _write_weight(model_dir, "w.bin", content)
+    # Drop a file outside the model dir that matches size+sha, to prove the
+    # provisioner refuses to return it.
+    outside = tmp_path / "escape.bin"
+    outside.write_bytes(content)
+    import hashlib as _h
+    entry = {
+        "model_id": "w",
+        "name": "w",
+        "kind": "whisper",
+        "path": "../escape.bin",
+        "quant_format": "q4",
+        "size_bytes": len(content),
+        "sha256": _h.sha256(content).hexdigest(),
+        "license": "",
+    }
+    # Bypass manifest validation by constructing the entry directly.
+    from localmind.provisioning.manifest import ModelEntry
+    prov = Provisioner(model_dir)
+    bad_entry = ModelEntry(**entry)
+    with pytest.raises(ManifestError):
+        prov._resolve_confined(bad_entry)
+
+
+def test_require_model_returns_path_within_model_dir(tmp_path):
+    model_dir = tmp_path / "models"
+    content = b"local" * 8
+    _write_weight(model_dir, "sub/w.bin", content)
+    entry = _entry("w", "sub/w.bin", content)
+    _write_manifest(model_dir, [entry])
+
+    path = Provisioner(model_dir).require_model("w")
+    base = model_dir.resolve()
+    assert path.resolve().is_relative_to(base)
+

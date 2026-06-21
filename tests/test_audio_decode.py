@@ -1,14 +1,14 @@
 """Acceptance tests for AC-1: decode local audio to normalized PCM.
 
 WAV paths are fully exercised (stdlib backend, no external deps). Compressed
-formats (m4a/mp3) require the optional ffmpeg backend; their positive cases
-are skipped when ffmpeg is absent, while the graceful-unavailable behavior is
+formats (m4a/mp3) are decoded via the ffmpeg backend, which resolves a binary
+from the system PATH or the bundled imageio-ffmpeg package; positive cases run
+when any ffmpeg binary is available, and the graceful-unavailable behavior is
 always asserted.
 """
 
 from __future__ import annotations
 
-import shutil
 import wave
 from pathlib import Path
 
@@ -21,9 +21,10 @@ from localmind.audio import (
     UnsupportedFormatError,
     decode_audio,
 )
+from localmind.audio import decode as decode_mod
 from localmind.audio.decode import TARGET_SAMPLE_RATE
 
-ffmpeg_available = shutil.which("ffmpeg") is not None
+ffmpeg_available = decode_mod._ffmpeg_available()
 
 
 # --------------------------------------------------------------------------- #
@@ -134,40 +135,103 @@ def test_wav_with_zero_frames_is_rejected(tmp_path, make_wav):
 
 
 # --------------------------------------------------------------------------- #
-# Compressed-format backend (ffmpeg)                                          #
+# Compressed-format backend (ffmpeg via imageio-ffmpeg fallback)              #
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.skipif(not ffmpeg_available, reason="ffmpeg not installed")
-def test_decode_mp3_when_ffmpeg_available(tmp_path):
-    # Generate a WAV first, then transcode to mp3 with ffmpeg.
-    wav = tmp_path / "tone.wav"
-    n = 16000
-    t = np.arange(n) / 16000
+def _make_sine_wav(path: Path, duration: float = 1.0, sr: int = 16000) -> Path:
+    n = int(duration * sr)
+    t = np.arange(n) / sr
     samples = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
-    with wave.open(str(wav), "wb") as wf:
+    with wave.open(str(path), "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(16000)
+        wf.setframerate(sr)
         wf.writeframes((samples * 32767).astype("<i2").tobytes())
+    return path
 
+
+def _transcode(src: Path, dst: Path) -> Path:
     import subprocess
-    mp3 = tmp_path / "tone.mp3"
+    exe = decode_mod._ffmpeg_exe()
+    assert exe is not None, "ffmpeg required for transcode fixture"
     subprocess.run(
-        ["ffmpeg", "-loglevel", "error", "-y", "-i", str(wav), str(mp3)], check=True
+        [exe, "-loglevel", "error", "-y", "-i", str(src), str(dst)], check=True
     )
+    return dst
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="no ffmpeg binary available")
+def test_decode_mp3_positive(tmp_path):
+    wav = _make_sine_wav(tmp_path / "tone.wav")
+    mp3 = _transcode(wav, tmp_path / "tone.mp3")
 
     decoded = decode_audio(mp3)
     assert decoded.sample_rate == 16000
     assert decoded.original_format == "mp3"
     assert decoded.samples.ndim == 1
+    assert decoded.samples.dtype == np.float32
     assert decoded.duration_sec == pytest.approx(1.0, abs=0.05)
+    assert np.max(np.abs(decoded.samples)) > 0.1  # signal survived round-trip
 
 
-def test_m4a_without_ffmpeg_raises_unavailable_not_crash(tmp_path):
-    if ffmpeg_available:
-        pytest.skip("ffmpeg is installed; the unavailable path cannot be exercised")
+@pytest.mark.skipif(not ffmpeg_available, reason="no ffmpeg binary available")
+def test_decode_m4a_positive(tmp_path):
+    wav = _make_sine_wav(tmp_path / "tone.wav")
+    m4a = _transcode(wav, tmp_path / "tone.m4a")
+
+    decoded = decode_audio(m4a)
+    assert decoded.sample_rate == 16000
+    assert decoded.original_format == "m4a"
+    assert decoded.samples.ndim == 1
+    assert decoded.duration_sec == pytest.approx(1.0, abs=0.05)
+    assert np.max(np.abs(decoded.samples)) > 0.1
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="no ffmpeg binary available")
+def test_decode_mp3_and_m4a_preserve_signal_frequency(tmp_path):
+    """Both compressed decodes should preserve the 440 Hz tone (robust to encoder priming)."""
+    wav = _make_sine_wav(tmp_path / "tone.wav", duration=1.0)
+
+    for ext in ("mp3", "m4a"):
+        comp = _transcode(wav, tmp_path / f"tone.{ext}")
+        dec = decode_audio(comp)
+        # Duration is ~1s (encoder priming may shift it slightly).
+        assert dec.duration_sec == pytest.approx(1.0, abs=0.1)
+        # The dominant spectral peak should be at 440 Hz, robust to priming delay.
+        spectrum = np.abs(np.fft.rfft(dec.samples.astype(np.float64)))
+        freqs = np.fft.rfftfreq(dec.samples.size, d=1.0 / dec.sample_rate)
+        peak_freq = freqs[np.argmax(spectrum)]
+        assert peak_freq == pytest.approx(440.0, abs=10.0)
+
+
+def test_compressed_format_unavailable_raises_not_crash(tmp_path, monkeypatch):
+    """When no ffmpeg binary is resolvable, compressed formats fail gracefully."""
+    monkeypatch.setattr(decode_mod, "shutil", type("S", (), {"which": staticmethod(lambda _: None)})())
+    monkeypatch.setattr(decode_mod, "imageio_ffmpeg", None)
     m4a = tmp_path / "clip.m4a"
     m4a.write_bytes(b"fake m4a bytes")
 
     with pytest.raises(DecoderUnavailableError):
         decode_audio(m4a)
+
+
+def test_ffmpeg_backend_uses_imageio_fallback_when_system_absent(tmp_path, monkeypatch):
+    """imageio-ffmpeg is used when system ffmpeg is missing."""
+    if not ffmpeg_available:
+        pytest.skip("no ffmpeg binary available to exercise the fallback")
+
+    class _FakeShutil:
+        @staticmethod
+        def which(_cmd):
+            return None  # pretend system ffmpeg is absent
+
+    monkeypatch.setattr(decode_mod, "shutil", _FakeShutil())
+    exe = decode_mod._ffmpeg_exe()
+    assert exe is not None  # imageio-ffmpeg fallback resolved a binary
+
+    wav = _make_sine_wav(tmp_path / "tone.wav")
+    mp3 = _transcode(wav, tmp_path / "tone.mp3")
+    decoded = decode_audio(mp3)
+    assert decoded.original_format == "mp3"
+    assert decoded.samples.size > 0
+

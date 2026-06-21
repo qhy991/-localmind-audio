@@ -16,6 +16,7 @@ Design contract (enforced by tests):
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -25,7 +26,7 @@ from localmind.provisioning.errors import (
     ManifestError,
     ModelNotProvisionedError,
 )
-from localmind.provisioning.manifest import ModelEntry, ModelManifest
+from localmind.provisioning.manifest import ModelEntry, ModelManifest, validate_weight_path
 
 # Buffer size for streaming SHA-256; large enough to be fast, small enough to
 # keep memory bounded regardless of weight file size.
@@ -69,7 +70,26 @@ class Provisioner:
         return ModelManifest.from_file(self.manifest_path)
 
     def weight_path(self, entry: ModelEntry) -> Path:
+        # Defense in depth: the manifest validator already rejects absolute and
+        # traversal paths, but re-check here so a hand-built entry cannot escape.
+        validate_weight_path(entry.path, where=entry.model_id)
         return self.model_dir / entry.path
+
+    def _resolve_confined(self, entry: ModelEntry) -> Path:
+        """Resolve a weight path and assert it stays within the model directory."""
+        candidate = self.weight_path(entry)
+        base = self.model_dir.resolve()
+        resolved = candidate.resolve()
+        # is_relative_to exists on Python 3.9+; fall back to string-prefix check.
+        try:
+            inside = resolved.is_relative_to(base)
+        except AttributeError:  # pragma: no cover
+            inside = str(resolved).startswith(str(base) + os.sep) or resolved == base
+        if not inside:
+            raise ManifestError(
+                f"weight path escapes model directory for {entry.model_id!r}: {entry.path!r}"
+            )
+        return resolved
 
     @staticmethod
     def sha256_of(path) -> str:
@@ -81,8 +101,11 @@ class Provisioner:
         return h.hexdigest()
 
     def verify_entry(self, entry: ModelEntry) -> VerificationResult:
-        """Verify one entry: existence, size, then SHA-256."""
-        path = self.weight_path(entry)
+        """Verify one entry: confinement, existence, size, then SHA-256."""
+        try:
+            path = self._resolve_confined(entry)
+        except ManifestError as exc:
+            return VerificationResult(entry.model_id, ok=False, reason=str(exc))
         if not path.is_file():
             return VerificationResult(entry.model_id, ok=False, reason="file missing")
         actual_size = path.stat().st_size
@@ -126,7 +149,7 @@ class Provisioner:
                 f"model not provisioned: {model_id!r} is not declared in the manifest"
             ) from None
 
-        path = self.weight_path(entry)
+        path = self._resolve_confined(entry)
         if not path.is_file():
             raise ModelNotProvisionedError(
                 f"model not provisioned: weight file missing for {model_id!r} at {path}"
