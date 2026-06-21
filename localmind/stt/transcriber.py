@@ -1,20 +1,22 @@
 """Transcriber interface, tier resolution, and implementations.
 
 * :class:`Transcriber` — abstract interface over a bounded audio source. The
-  real backend takes a :class:`ResolvedTier` (not a raw path) so a model tier
-  must be resolved through the provisioner first.
+  real backend takes a :class:`Provisioner` and a tier id (not a pre-built
+  path or tier) so the model is resolved through the provisioner *inside* the
+  adapter boundary, immediately before backend invocation.
 * :func:`resolve_tier` — resolve a model tier through the provisioner so a
   missing tier fast-fails with ``ModelNotProvisionedError`` and **never**
   downloads, returning a :class:`ResolvedTier` carrying the provenance fields
   (tier, model_id, model_path, sha256) that downstream run records emit.
 * :class:`MockTranscriber` — deterministic, dependency-free transcriber for
   tests: emits ordered timestamped segments bounded by the audio duration.
-* :class:`WhisperTranscriber` — the real adapter over ``mlx-whisper``. It
-  transcribes chunk-by-chunk from a bounded source, converts backend segments to
-  :class:`TranscriptSegment`, merges overlapping chunk outputs without producing
-  non-monotonic timestamps, normalizes ids, and validates the result before
-  returning. It refuses to run without a verified local model path and without
-  ``mlx-whisper`` installed (never a silent cloud fallback or download).
+* :class:`WhisperTranscriber` — the real adapter over ``mlx-whisper``. It calls
+  :func:`resolve_tier` itself (so the verified path can only come from
+  ``Provisioner.require_model``), then transcribes chunk-by-chunk from a bounded
+  source, converts backend segments to :class:`TranscriptSegment`, merges
+  overlapping chunk outputs without producing non-monotonic timestamps,
+  normalizes ids, and validates the result before returning. A hand-built
+  :class:`ResolvedTier` is not accepted as the authority for backend loading.
 """
 
 from __future__ import annotations
@@ -39,7 +41,12 @@ _RawSegment = Tuple[float, float, str]
 
 @dataclass(frozen=True)
 class ResolvedTier:
-    """A verified model tier plus the provenance fields a run record emits."""
+    """A verified model tier plus the provenance fields a run record emits.
+
+    This is a *record* of a resolution that happened inside the adapter
+    boundary; it is not accepted as input to the real backend (callers pass a
+    ``Provisioner`` + tier id, and the adapter resolves fresh).
+    """
 
     tier: str
     model_id: str
@@ -52,8 +59,9 @@ def resolve_tier(provisioner: Provisioner, tier_model_id: str) -> ResolvedTier:
     """Resolve a model tier to a verified path plus provenance.
 
     Goes through ``Provisioner.require_model`` so an unprovisioned tier raises
-    ``ModelNotProvisionedError`` (no network download). The manifest entry's
-    sha256/quant_format are carried into the returned provenance object.
+    ``ModelNotProvisionedError`` (no network download) and a tampered weight
+    raises ``ChecksumMismatchError``. The manifest entry's sha256/quant_format
+    are carried into the returned provenance object.
     """
     manifest = provisioner.load_manifest()
     try:
@@ -62,7 +70,7 @@ def resolve_tier(provisioner: Provisioner, tier_model_id: str) -> ResolvedTier:
         raise ModelNotProvisionedError(
             f"model not provisioned: {tier_model_id!r} is not declared in the manifest"
         ) from None
-    path = provisioner.require_model(tier_model_id)  # verifies size + sha256
+    path = provisioner.require_model(tier_model_id)  # verifies size + sha256, confines
     return ResolvedTier(
         tier=tier_model_id,
         model_id=tier_model_id,
@@ -120,7 +128,8 @@ class Transcriber(ABC):
         self,
         source: AudioSource,
         config: ChunkingConfig,
-        resolved_tier: ResolvedTier,
+        provisioner: Provisioner,
+        tier_model_id: str,
         on_progress: Optional[ProgressCallback] = None,
     ) -> List[TranscriptSegment]:
         """Transcribe audio from a bounded source into ordered timestamped segments."""
@@ -132,7 +141,8 @@ class MockTranscriber(Transcriber):
 
     Emits one segment per chunk (respecting the bounded chunking config), then
     merges overlapping chunk outputs so the result is monotonic and validated.
-    The ``resolved_tier`` is accepted for interface compatibility and ignored.
+    The ``provisioner``/``tier_model_id`` are accepted for interface
+    compatibility and ignored (no real model is loaded).
     """
 
     def __init__(self, label: str = "mock"):
@@ -142,7 +152,8 @@ class MockTranscriber(Transcriber):
         self,
         source: AudioSource,
         config: ChunkingConfig,
-        resolved_tier: ResolvedTier,
+        provisioner: Provisioner,
+        tier_model_id: str,
         on_progress: Optional[ProgressCallback] = None,
     ) -> List[TranscriptSegment]:
         duration = source.duration_sec
@@ -163,36 +174,34 @@ class MockTranscriber(Transcriber):
 class WhisperTranscriber(Transcriber):
     """Real Whisper transcription via mlx-whisper, chunk-by-chunk.
 
-    Requires a :class:`ResolvedTier` (from :func:`resolve_tier`) and asserts the
-    model path exists locally before invoking the backend, so a Hugging Face
-    repo id or any other non-local string cannot be passed through and downloaded
-    at runtime. Each bounded chunk is transcribed with ``mlx_whisper.transcribe``
-    against the local model path; backend segments are converted to
-    :class:`TranscriptSegment`, their timestamps offset by the chunk's file
-    position, and the overlapping chunk outputs are merged without producing
-    non-monotonic timestamps. Bad backend output (empty text, out-of-bounds
-    timestamps, non-monotonic order) is rejected by :func:`validate_segments`.
+    The adapter owns the model-resolution boundary: callers pass a
+    :class:`Provisioner` and a tier id, and the adapter calls
+    :func:`resolve_tier` (which runs ``Provisioner.require_model`` — verifying
+    size + SHA-256 and confining the path to the model directory) immediately
+    before invoking the backend. Only the freshly verified path is passed to
+    ``mlx_whisper.transcribe``. A pre-built :class:`ResolvedTier` is not
+    accepted, so an arbitrary existing local file cannot reach the backend.
+
+    After a run, ``self.last_provenance`` holds the resolved tier for downstream
+    run records.
     """
 
     def __init__(self, language: Optional[str] = None):
         self.language = language
+        self.last_provenance: Optional[ResolvedTier] = None
 
     def transcribe(
         self,
         source: AudioSource,
         config: ChunkingConfig,
-        resolved_tier: ResolvedTier,
+        provisioner: Provisioner,
+        tier_model_id: str,
         on_progress: Optional[ProgressCallback] = None,
     ) -> List[TranscriptSegment]:
-        if not isinstance(resolved_tier, ResolvedTier):
+        if not isinstance(provisioner, Provisioner):
             raise TypeError(
-                "WhisperTranscriber requires a ResolvedTier from resolve_tier(); "
-                "raw paths or repo ids are not accepted"
-            )
-        if not resolved_tier.model_path.exists():
-            raise ModelNotProvisionedError(
-                f"model path does not exist: {resolved_tier.model_path}; "
-                f"resolve the tier through the provisioner (see docs/provisioning.md)"
+                "WhisperTranscriber requires a Provisioner and a tier id; a "
+                "pre-built ResolvedTier or raw path is not accepted"
             )
 
         try:
@@ -203,6 +212,13 @@ class WhisperTranscriber(Transcriber):
                 "`pip install -e '.[ml]'` (see docs/provisioning.md) before using WhisperTranscriber"
             ) from exc
 
+        # Resolve the tier inside the adapter boundary, immediately before
+        # backend invocation. This re-runs size + SHA-256 verification and
+        # confines the path to the model directory; an unprovisioned or tampered
+        # tier fast-fails here, before mlx_whisper is called.
+        resolved = resolve_tier(provisioner, tier_model_id)
+        self.last_provenance = resolved
+
         duration = source.duration_sec
         chunk_results: List[Tuple[float, List[_RawSegment]]] = []
         for chunk in iter_audio_chunks(source, config):
@@ -211,7 +227,7 @@ class WhisperTranscriber(Transcriber):
                 continue
             result = mlx_whisper.transcribe(
                 np.ascontiguousarray(chunk.samples, dtype=np.float32),
-                path_or_hf_repo=str(resolved_tier.model_path),
+                path_or_hf_repo=str(resolved.model_path),
                 language=self.language,
                 verbose=False,
             )
@@ -242,3 +258,4 @@ class WhisperTranscriber(Transcriber):
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError(f"backend segment timestamp must be a number, got {value!r}")
         return float(value)
+

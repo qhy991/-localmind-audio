@@ -47,19 +47,6 @@ def _seg(i, start, end, text="x"):
     return TranscriptSegment(id=f"seg-{i:04d}", start=start, end=end, text=text)
 
 
-def _tier(tmp_path: Path, exists: bool = True) -> ResolvedTier:
-    p = tmp_path / "model.bin"
-    if exists:
-        p.write_bytes(b"pretend-weights" * 16)
-    return ResolvedTier(
-        tier="whisper-small",
-        model_id="whisper-small",
-        model_path=p,
-        sha256="0" * 64,
-        quant_format="int4",
-    )
-
-
 def _write_sine_wav(path, duration_sec=5.0, sr=16000):
     n = int(duration_sec * sr)
     t = np.arange(n) / sr
@@ -341,8 +328,9 @@ def test_mock_transcriber_emits_ordered_bounded_segments(tmp_path):
     sr = 16000
     source = ArrayAudioSource(np.zeros(int(12 * sr), np.float32), sr)
     t = MockTranscriber()
+    # Mock ignores the provisioner/tier id (no real model loaded).
     segs = t.transcribe(
-        source, ChunkingConfig(chunk_duration_sec=5.0, overlap_sec=1.0), _tier(tmp_path)
+        source, ChunkingConfig(chunk_duration_sec=5.0, overlap_sec=1.0), None, "mock"
     )
     # Overlap is trimmed: 3 chunks -> 3 non-overlapping segments.
     assert len(segs) == 3
@@ -397,7 +385,7 @@ def test_whisper_transcriber_converts_offsets_and_validates(monkeypatch, tmp_pat
     source = ArrayAudioSource(np.zeros(int(12 * sr), np.float32), sr)
     config = ChunkingConfig(chunk_duration_sec=5.0, overlap_sec=1.0)
     t = WhisperTranscriber(language="en")
-    segs = t.transcribe(source, config, _tier(tmp_path))
+    segs = t.transcribe(source, config, _prov_with_model(tmp_path), "whisper-small")
 
     # 3 chunks; overlap trimming drops the early segment of chunks 1 and 2,
     # leaving 4 segments (chunk0's two + one late segment from each later chunk).
@@ -407,6 +395,10 @@ def test_whisper_transcriber_converts_offsets_and_validates(monkeypatch, tmp_pat
     assert segs[2].end == pytest.approx(5.5)
     assert len({s.id for s in segs}) == 4
     validate_segments(segs, audio_duration_sec=12.0)
+    # Provenance of the freshly resolved (verified) tier is recorded.
+    assert t.last_provenance is not None
+    assert t.last_provenance.model_id == "whisper-small"
+    assert len(t.last_provenance.sha256) == 64
 
 
 def test_whisper_transcriber_overlap_merge_regression(monkeypatch, tmp_path):
@@ -421,7 +413,9 @@ def test_whisper_transcriber_overlap_merge_regression(monkeypatch, tmp_path):
     sr = 16000
     source = ArrayAudioSource(np.zeros(int(13 * sr), np.float32), sr)
     config = ChunkingConfig(chunk_duration_sec=5.0, overlap_sec=1.0)
-    segs = WhisperTranscriber().transcribe(source, config, _tier(tmp_path))
+    segs = WhisperTranscriber().transcribe(
+        source, config, _prov_with_model(tmp_path), "whisper-small"
+    )
 
     # chunk0 keeps both; chunks 1 and 2 keep only their late segment.
     assert [s.start for s in segs] == pytest.approx([0.0, 4.5, 8.5, 12.5])
@@ -439,7 +433,7 @@ def test_whisper_transcriber_does_not_touch_network(monkeypatch, tmp_path):
     monkeypatch.setattr(socket, "socket", _no_network)
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     WhisperTranscriber().transcribe(
-        source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path)
+        source, ChunkingConfig(chunk_duration_sec=5.0), _prov_with_model(tmp_path), "whisper-small"
     )
 
 
@@ -447,67 +441,115 @@ def test_whisper_transcriber_rejects_non_dict_result(monkeypatch, tmp_path):
     _install_fake_mlx_whisper(monkeypatch, _FakeMlxWhisper(raw_result=["not", "a", "dict"]))
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     with pytest.raises(ValueError, match="dict"):
-        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path))
+        WhisperTranscriber().transcribe(
+            source, ChunkingConfig(chunk_duration_sec=5.0), _prov_with_model(tmp_path), "whisper-small"
+        )
 
 
 def test_whisper_transcriber_rejects_non_list_segments(monkeypatch, tmp_path):
     _install_fake_mlx_whisper(monkeypatch, _FakeMlxWhisper(raw_result={"segments": "nope"}))
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     with pytest.raises(ValueError, match="list"):
-        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path))
+        WhisperTranscriber().transcribe(
+            source, ChunkingConfig(chunk_duration_sec=5.0), _prov_with_model(tmp_path), "whisper-small"
+        )
 
 
 def test_whisper_transcriber_rejects_empty_text(monkeypatch, tmp_path):
     _install_fake_mlx_whisper(monkeypatch, _FakeMlxWhisper(fail_text=True))
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     with pytest.raises(SegmentValidationError, match="text"):
-        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path))
+        WhisperTranscriber().transcribe(
+            source, ChunkingConfig(chunk_duration_sec=5.0), _prov_with_model(tmp_path), "whisper-small"
+        )
 
 
 def test_whisper_transcriber_rejects_out_of_bounds_timestamps(monkeypatch, tmp_path):
     _install_fake_mlx_whisper(monkeypatch, _FakeMlxWhisper(out_of_bounds=True))
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     with pytest.raises(SegmentValidationError, match="exceeds audio duration"):
-        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path))
+        WhisperTranscriber().transcribe(
+            source, ChunkingConfig(chunk_duration_sec=5.0), _prov_with_model(tmp_path), "whisper-small"
+        )
 
 
 # --------------------------------------------------------------------------- #
-# ResolvedTier backend boundary                                               #
+# Backend boundary: the verified path can only come from the provisioner      #
 # --------------------------------------------------------------------------- #
 
-def test_whisper_transcriber_rejects_missing_model_path_before_backend(monkeypatch, tmp_path):
-    """A missing local path is rejected before mlx_whisper is ever called."""
+def test_whisper_transcriber_rejects_undeclared_tier_before_backend(monkeypatch, tmp_path):
+    """A tier not in the manifest fast-fails before the backend runs."""
     backend = _FakeMlxWhisper()
     _install_fake_mlx_whisper(monkeypatch, backend)
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     with pytest.raises(ModelNotProvisionedError):
         WhisperTranscriber().transcribe(
-            source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path, exists=False)
+            source, ChunkingConfig(chunk_duration_sec=5.0),
+            _prov_with_empty_manifest(tmp_path), "whisper-small",
         )
-    assert backend.call_count == 0  # backend never invoked
-
-
-def test_whisper_transcriber_rejects_repo_like_path_before_backend(monkeypatch, tmp_path):
-    """A Hugging-Face-repo-like string is not a local file; rejected before backend."""
-    backend = _FakeMlxWhisper()
-    _install_fake_mlx_whisper(monkeypatch, backend)
-    source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
-    repo_tier = ResolvedTier(
-        tier="whisper-small", model_id="whisper-small",
-        model_path=Path("mlx-community/whisper-tiny-mlx"), sha256="0" * 64, quant_format="int4",
-    )
-    with pytest.raises(ModelNotProvisionedError):
-        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), repo_tier)
     assert backend.call_count == 0
 
 
-def test_whisper_transcriber_rejects_raw_path_not_tier(tmp_path):
-    """The adapter takes a ResolvedTier, never a raw path."""
+def test_whisper_transcriber_rejects_existing_file_not_in_manifest(monkeypatch, tmp_path):
+    """An existing local file that is NOT declared in any manifest cannot reach
+    the backend — the adapter resolves the tier through the provisioner, and an
+    undeclared tier fast-fails. (Closes the forged-ResolvedTier vector.)"""
+    backend = _FakeMlxWhisper()
+    _install_fake_mlx_whisper(monkeypatch, backend)
+    # An existing file on disk that no manifest references:
+    (tmp_path / "evil.bin").write_bytes(b"not-a-provisioned-model")
+    source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
+    with pytest.raises(ModelNotProvisionedError):
+        WhisperTranscriber().transcribe(
+            source, ChunkingConfig(chunk_duration_sec=5.0),
+            _prov_with_empty_manifest(tmp_path), "evil",
+        )
+    assert backend.call_count == 0
+
+
+def test_whisper_transcriber_rejects_forged_resolved_tier(monkeypatch, tmp_path):
+    """The old forged-tier shape is gone: a hand-built ResolvedTier passed where
+    a Provisioner is expected is a TypeError, and the backend is never called."""
+    backend = _FakeMlxWhisper()
+    _install_fake_mlx_whisper(monkeypatch, backend)
+    (tmp_path / "evil.bin").write_bytes(b"not-a-provisioned-model")
+    forged = ResolvedTier(
+        tier="evil", model_id="evil",
+        model_path=tmp_path / "evil.bin", sha256="0" * 64, quant_format="int4",
+    )
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     with pytest.raises(TypeError):
         WhisperTranscriber().transcribe(
-            source, ChunkingConfig(chunk_duration_sec=5.0), tmp_path / "not-a-tier"
+            source, ChunkingConfig(chunk_duration_sec=5.0), forged, "evil"
         )
+    assert backend.call_count == 0
+
+
+def test_whisper_transcriber_rejects_raw_path_as_provisioner(tmp_path):
+    source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
+    with pytest.raises(TypeError):
+        WhisperTranscriber().transcribe(
+            source, ChunkingConfig(chunk_duration_sec=5.0), tmp_path / "not-a-provisioner", "x"
+        )
+
+
+def test_whisper_transcriber_rejects_tampered_weight_before_backend(monkeypatch, tmp_path):
+    """A manifest-declared weight whose checksum no longer matches fast-fails
+    (ChecksumMismatchError) before the backend runs."""
+    backend = _FakeMlxWhisper()
+    _install_fake_mlx_whisper(monkeypatch, backend)
+    prov = _prov_with_model(tmp_path)
+    # Tamper with the declared weight after the manifest was written (same length).
+    weight = prov.model_dir / "whisper-small.mlmodel"
+    original = weight.read_bytes()
+    weight.write_bytes(b"X" * len(original) if original else b"X")
+    source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
+    from localmind.provisioning import ChecksumMismatchError
+    with pytest.raises(ChecksumMismatchError):
+        WhisperTranscriber().transcribe(
+            source, ChunkingConfig(chunk_duration_sec=5.0), prov, "whisper-small"
+        )
+    assert backend.call_count == 0
 
 
 def test_whisper_transcriber_raises_clear_error_without_mlx_whisper(monkeypatch, tmp_path):
@@ -515,7 +557,7 @@ def test_whisper_transcriber_raises_clear_error_without_mlx_whisper(monkeypatch,
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     with pytest.raises(RuntimeError, match="mlx-whisper"):
         WhisperTranscriber().transcribe(
-            source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path)
+            source, ChunkingConfig(chunk_duration_sec=5.0), _prov_with_model(tmp_path), "whisper-small"
         )
 
 
