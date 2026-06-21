@@ -167,3 +167,23 @@ touches no network.
 Bump `schema_version` and extend `validate_manifest_dict` when the on-disk shape
 changes. The provisioner refuses unknown versions, so old builds fail loudly
 against a newer manifest rather than silently misbehaving.
+
+## 7. Installing the STT backend
+
+The real transcription backend (`WhisperTranscriber`) uses `mlx-whisper`, which
+is an optional, Apple-silicon-only dependency. It is declared in the project's
+`ml` extra, not the base runtime, so provisioning/storage/decode work without it.
+
+Install it (on Python 3.11+, Apple Silicon) with:
+
+```bash
+.venv/bin/python -m pip install -e ".[ml]"
+```
+
+`WhisperTranscriber.transcribe()` accepts a `ResolvedTier` from
+`resolve_tier()`, never a raw path or a Hugging Face repo id. It asserts the
+model path exists locally before calling `mlx_whisper.transcribe`, so the
+runtime cannot be tricked into a network model pull — the zero-network guarantee
+(AC-5) and the missing-tier fast-fail (AC-2/AC-9) both hold at the adapter
+boundary.
+

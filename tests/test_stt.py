@@ -1,6 +1,6 @@
-"""Tests for the STT framework: segment validation, bounded chunking, tier
-resolution, mock transcriber, and the WhisperTranscriber adapter (with a fake
-mlx_whisper module so logic is verified without real weights).
+"""Tests for the STT framework: segment validation, bounded chunking (WAV and
+compressed sources), tier resolution, mock transcriber, and the WhisperTranscriber
+adapter (with a fake mlx_whisper module so logic is verified without weights).
 """
 
 from __future__ import annotations
@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import socket
+import subprocess
 import sys
 import wave
 from pathlib import Path
@@ -15,30 +16,72 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from localmind.audio.decode import _ffmpeg_exe
+from localmind.audio.errors import UnsupportedFormatError
 from localmind.provisioning import ModelNotProvisionedError, Provisioner
 from localmind.stt import (
     MAX_UNCHUNKED_SEC,
     ArrayAudioSource,
     ChunkingConfig,
+    FFmpegAudioSource,
     MockTranscriber,
     ResolvedTier,
     TranscriptSegment,
     WavAudioSource,
     WhisperTranscriber,
+    audio_source_from_path,
     iter_audio_chunks,
     resolve_tier,
     validate_segments,
 )
 from localmind.stt.segment import SegmentValidationError
 
+ffmpeg_available = _ffmpeg_exe() is not None
+
 
 # --------------------------------------------------------------------------- #
-# Segment validation                                                          #
+# helpers                                                                      #
 # --------------------------------------------------------------------------- #
 
 def _seg(i, start, end, text="x"):
     return TranscriptSegment(id=f"seg-{i:04d}", start=start, end=end, text=text)
 
+
+def _tier(tmp_path: Path, exists: bool = True) -> ResolvedTier:
+    p = tmp_path / "model.bin"
+    if exists:
+        p.write_bytes(b"pretend-weights" * 16)
+    return ResolvedTier(
+        tier="whisper-small",
+        model_id="whisper-small",
+        model_path=p,
+        sha256="0" * 64,
+        quant_format="int4",
+    )
+
+
+def _write_sine_wav(path, duration_sec=5.0, sr=16000):
+    n = int(duration_sec * sr)
+    t = np.arange(n) / sr
+    samples = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes((samples * 32767).astype("<i2").tobytes())
+    return path
+
+
+def _transcode(src: Path, dst: Path) -> Path:
+    exe = _ffmpeg_exe()
+    assert exe is not None
+    subprocess.run([exe, "-loglevel", "error", "-y", "-i", str(src), str(dst)], check=True)
+    return dst
+
+
+# --------------------------------------------------------------------------- #
+# Segment validation                                                          #
+# --------------------------------------------------------------------------- #
 
 def test_validate_segments_accepts_ordered_bounded_nonempty():
     segs = [_seg(0, 0.0, 2.0, "hello"), _seg(1, 2.0, 4.5, "world")]
@@ -46,7 +89,6 @@ def test_validate_segments_accepts_ordered_bounded_nonempty():
 
 
 def test_validate_segments_rejects_non_monotonic_timestamps():
-    # Second segment starts before the first (1.0 < 2.0) -> non-monotonic.
     segs = [_seg(0, 2.0, 4.0), _seg(1, 1.0, 3.0)]
     with pytest.raises(SegmentValidationError, match="monotonically"):
         validate_segments(segs, audio_duration_sec=10.0)
@@ -65,7 +107,6 @@ def test_validate_segments_rejects_empty_text():
 
 
 def test_validate_segments_rejects_flat_untimed_zero_length():
-    """A flat untimed transcript (start==end==0) is rejected."""
     segs = [TranscriptSegment(id="seg-0000", start=0.0, end=0.0, text="all")]
     with pytest.raises(SegmentValidationError, match="end > start"):
         validate_segments(segs, audio_duration_sec=10.0)
@@ -123,25 +164,21 @@ def test_iter_audio_chunks_bounded_over_array_source():
 
 
 def test_bounded_memory_does_not_scale_with_file_length():
-    """The largest live window stays bounded regardless of total duration."""
     sr = 16000
     config = ChunkingConfig(chunk_duration_sec=30.0, overlap_sec=1.0)
-    cap = int(round((config.chunk_duration_sec) * sr))  # window is chunk_duration
+    cap = int(round(config.chunk_duration_sec * sr))
 
     short = FakeAudioSource(60.0, sr)
     list(iter_audio_chunks(short, config))
-    long_src = FakeAudioSource(60 * 60.0, sr)  # 60 min, but never allocated
+    long_src = FakeAudioSource(60 * 60.0, sr)
     list(iter_audio_chunks(long_src, config))
 
-    # Peak materialized window is bounded by the chunk window in both cases,
-    # and does NOT grow with total duration. No 60-minute array was allocated.
     assert short.max_window_samples <= cap + 1
     assert long_src.max_window_samples <= cap + 1
     assert long_src.max_window_samples == short.max_window_samples
 
 
 def test_chunking_disabled_on_long_file_is_rejected():
-    # 60-minute source with chunking disabled -> rejected, no allocation.
     source = FakeAudioSource(60 * 60.0, 16000)
     with pytest.raises(ValueError, match="mandatory for long audio"):
         list(iter_audio_chunks(source, ChunkingConfig(enabled=False)))
@@ -162,26 +199,88 @@ def test_invalid_chunking_config_rejected():
         ChunkingConfig(overlap_sec=5.0, chunk_duration_sec=5.0)
 
 
-def _write_sine_wav(path, duration_sec=5.0, sr=16000):
-    n = int(duration_sec * sr)
-    t = np.arange(n) / sr
-    samples = (0.5 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
-    with wave.open(str(path), "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        wf.writeframes((samples * 32767).astype("<i2").tobytes())
-    return path
-
-
 def test_wav_audio_source_reads_only_window(tmp_path):
     wav = _write_sine_wav(tmp_path / "tone.wav", duration_sec=10.0, sr=16000)
     src = WavAudioSource(wav, target_sample_rate=16000)
     assert src.duration_sec == pytest.approx(10.0, abs=1e-3)
     window = src.read_window(2.0, 3.0)
-    # A 1-second window at 16 kHz yields ~16000 samples, not the whole 10s file.
     assert window.size == pytest.approx(16000, abs=2)
     assert window.dtype == np.float32
+
+
+# --------------------------------------------------------------------------- #
+# audio_source_from_path factory + FFmpegAudioSource                         #
+# --------------------------------------------------------------------------- #
+
+def test_audio_source_from_path_dispatches_by_extension(tmp_path):
+    wav = _write_sine_wav(tmp_path / "t.wav", duration_sec=2.0, sr=16000)
+    assert isinstance(audio_source_from_path(wav), WavAudioSource)
+    with pytest.raises(UnsupportedFormatError):
+        audio_source_from_path(tmp_path / "x.flac")
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="no ffmpeg binary")
+def test_audio_source_from_path_returns_ffmpeg_source_for_compressed(tmp_path):
+    wav = _write_sine_wav(tmp_path / "t.wav", duration_sec=3.0, sr=16000)
+    m4a = _transcode(wav, tmp_path / "t.m4a")
+    mp3 = _transcode(wav, tmp_path / "t.mp3")
+    assert isinstance(audio_source_from_path(m4a), FFmpegAudioSource)
+    assert isinstance(audio_source_from_path(mp3), FFmpegAudioSource)
+
+
+@pytest.mark.skipif(not ffmpeg_available, reason="no ffmpeg binary")
+def test_ffmpeg_source_probes_duration_and_reads_window(tmp_path):
+    wav = _write_sine_wav(tmp_path / "tone.wav", duration_sec=5.0, sr=16000)
+    for ext in ("m4a", "mp3"):
+        comp = _transcode(wav, tmp_path / f"tone.{ext}")
+        src = FFmpegAudioSource(comp, target_sample_rate=16000)
+        assert src.duration_sec == pytest.approx(5.0, abs=0.25)
+        window = src.read_window(1.0, 2.0)
+        # A 1s window at 16 kHz; compressed seek is approximate, allow slack.
+        assert window.size == pytest.approx(16000, abs=600)
+        assert window.dtype == np.float32
+
+
+def test_ffmpeg_source_bounded_reads_do_not_scale_with_duration(monkeypatch, tmp_path):
+    """A 60-minute compressed source requests only chunk-window durations,
+    never a whole-file decode; doubling duration does not increase the largest
+    requested window."""
+    import localmind.stt.chunking as chunking_mod
+
+    state = {"max_t": 0.0}
+
+    def make_run(duration_label):
+        def fake_run(cmd, capture_output=True):
+            if "-t" in cmd:
+                i = cmd.index("-t")
+                t = float(cmd[i + 1])
+                if t > state["max_t"]:
+                    state["max_t"] = t
+                n = int(round(t * 16000))
+                return subprocess.CompletedProcess(cmd, 0, stdout=b"\x00" * (n * 4), stderr=b"")
+            # duration probe
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout=b"",
+                stderr=f"  Duration: {duration_label}, bitrate: 64 kb/s".encode("utf-8"),
+            )
+        return fake_run
+
+    config = ChunkingConfig(chunk_duration_sec=30.0, overlap_sec=1.0)
+
+    monkeypatch.setattr(chunking_mod.subprocess, "run", make_run("01:00:00.00"))
+    src60 = FFmpegAudioSource(tmp_path / "a.m4a", 16000)
+    list(iter_audio_chunks(src60, config))
+    cap60 = state["max_t"]
+
+    state["max_t"] = 0.0
+    monkeypatch.setattr(chunking_mod.subprocess, "run", make_run("02:00:00.00"))
+    src120 = FFmpegAudioSource(tmp_path / "b.m4a", 16000)
+    list(iter_audio_chunks(src120, config))
+    cap120 = state["max_t"]
+
+    assert cap60 <= config.chunk_duration_sec + 1e-6
+    assert cap120 <= config.chunk_duration_sec + 1e-6
+    assert cap60 == cap120  # bounded by chunk window, not file length
 
 
 # --------------------------------------------------------------------------- #
@@ -238,15 +337,19 @@ def test_resolve_tier_returns_provenance_when_provisioned(tmp_path):
 # MockTranscriber                                                             #
 # --------------------------------------------------------------------------- #
 
-def test_mock_transcriber_emits_ordered_bounded_segments():
+def test_mock_transcriber_emits_ordered_bounded_segments(tmp_path):
     sr = 16000
     source = ArrayAudioSource(np.zeros(int(12 * sr), np.float32), sr)
     t = MockTranscriber()
-    segs = t.transcribe(source, ChunkingConfig(chunk_duration_sec=5.0, overlap_sec=1.0), Path("/dev/null"))
-    # 12s with 5s chunks, 1s overlap -> hops at 0,4,8 -> 3 chunks/segments
+    segs = t.transcribe(
+        source, ChunkingConfig(chunk_duration_sec=5.0, overlap_sec=1.0), _tier(tmp_path)
+    )
+    # Overlap is trimmed: 3 chunks -> 3 non-overlapping segments.
     assert len(segs) == 3
     assert segs[-1].end == pytest.approx(12.0, abs=1e-3)
-    # Already validated inside transcribe; re-validate to be explicit.
+    # No overlap between consecutive segments.
+    for a, b in zip(segs, segs[1:]):
+        assert b.start >= a.end - 1e-6
     validate_segments(segs, audio_duration_sec=12.0)
 
 
@@ -286,7 +389,7 @@ def _install_fake_mlx_whisper(monkeypatch, fake):
     monkeypatch.setitem(sys.modules, "mlx_whisper", fake)
 
 
-def test_whisper_transcriber_converts_offsets_and_validates(monkeypatch):
+def test_whisper_transcriber_converts_offsets_and_validates(monkeypatch, tmp_path):
     fake = _FakeMlxWhisper()
     _install_fake_mlx_whisper(monkeypatch, fake)
 
@@ -294,21 +397,39 @@ def test_whisper_transcriber_converts_offsets_and_validates(monkeypatch):
     source = ArrayAudioSource(np.zeros(int(12 * sr), np.float32), sr)
     config = ChunkingConfig(chunk_duration_sec=5.0, overlap_sec=1.0)
     t = WhisperTranscriber(language="en")
-    segs = t.transcribe(source, config, Path("/models/whisper-small.mlmodel"))
+    segs = t.transcribe(source, config, _tier(tmp_path))
 
-    # 3 chunks (0,4,8) x 2 segments each = 6 segments.
+    # 3 chunks; overlap trimming drops the early segment of chunks 1 and 2,
+    # leaving 4 segments (chunk0's two + one late segment from each later chunk).
     assert fake.call_count == 3
-    assert len(segs) == 6
-    # First segment of the second chunk is offset by 4.0s.
-    assert segs[2].start == pytest.approx(4.0)
-    assert segs[2].end == pytest.approx(4.5)
-    # All ids normalized and unique.
-    assert len({s.id for s in segs}) == 6
-    # Passes validation (already done internally).
+    assert len(segs) == 4
+    assert segs[2].start == pytest.approx(5.0)
+    assert segs[2].end == pytest.approx(5.5)
+    assert len({s.id for s in segs}) == 4
     validate_segments(segs, audio_duration_sec=12.0)
 
 
-def test_whisper_transcriber_does_not_touch_network(monkeypatch):
+def test_whisper_transcriber_overlap_merge_regression(monkeypatch, tmp_path):
+    """Each chunk returns an early (0-0.5) and a late (4.5-4.8) segment; the
+    merged result must stay monotonic and drop the duplicated overlap content."""
+    fake = _FakeMlxWhisper(segments=[
+        {"start": 0.0, "end": 0.5, "text": "early"},
+        {"start": 4.5, "end": 4.8, "text": "late"},
+    ])
+    _install_fake_mlx_whisper(monkeypatch, fake)
+
+    sr = 16000
+    source = ArrayAudioSource(np.zeros(int(13 * sr), np.float32), sr)
+    config = ChunkingConfig(chunk_duration_sec=5.0, overlap_sec=1.0)
+    segs = WhisperTranscriber().transcribe(source, config, _tier(tmp_path))
+
+    # chunk0 keeps both; chunks 1 and 2 keep only their late segment.
+    assert [s.start for s in segs] == pytest.approx([0.0, 4.5, 8.5, 12.5])
+    assert len(segs) == 4
+    validate_segments(segs, audio_duration_sec=13.0)
+
+
+def test_whisper_transcriber_does_not_touch_network(monkeypatch, tmp_path):
     fake = _FakeMlxWhisper()
     _install_fake_mlx_whisper(monkeypatch, fake)
 
@@ -318,53 +439,90 @@ def test_whisper_transcriber_does_not_touch_network(monkeypatch):
     monkeypatch.setattr(socket, "socket", _no_network)
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     WhisperTranscriber().transcribe(
-        source, ChunkingConfig(chunk_duration_sec=5.0), Path("/models/w.mlmodel")
-    )  # would raise via _no_network if any network path were taken
+        source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path)
+    )
 
 
-def test_whisper_transcriber_rejects_non_dict_result(monkeypatch):
+def test_whisper_transcriber_rejects_non_dict_result(monkeypatch, tmp_path):
     _install_fake_mlx_whisper(monkeypatch, _FakeMlxWhisper(raw_result=["not", "a", "dict"]))
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     with pytest.raises(ValueError, match="dict"):
-        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), Path("/m"))
+        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path))
 
 
-def test_whisper_transcriber_rejects_non_list_segments(monkeypatch):
+def test_whisper_transcriber_rejects_non_list_segments(monkeypatch, tmp_path):
     _install_fake_mlx_whisper(monkeypatch, _FakeMlxWhisper(raw_result={"segments": "nope"}))
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     with pytest.raises(ValueError, match="list"):
-        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), Path("/m"))
+        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path))
 
 
-def test_whisper_transcriber_rejects_empty_text(monkeypatch):
+def test_whisper_transcriber_rejects_empty_text(monkeypatch, tmp_path):
     _install_fake_mlx_whisper(monkeypatch, _FakeMlxWhisper(fail_text=True))
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     with pytest.raises(SegmentValidationError, match="text"):
-        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), Path("/m"))
+        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path))
 
 
-def test_whisper_transcriber_rejects_out_of_bounds_timestamps(monkeypatch):
+def test_whisper_transcriber_rejects_out_of_bounds_timestamps(monkeypatch, tmp_path):
     _install_fake_mlx_whisper(monkeypatch, _FakeMlxWhisper(out_of_bounds=True))
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     with pytest.raises(SegmentValidationError, match="exceeds audio duration"):
-        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), Path("/m"))
+        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path))
 
 
-def test_whisper_transcriber_raises_clear_error_without_mlx_whisper(monkeypatch):
-    # Ensure no real or cached mlx_whisper is importable.
+# --------------------------------------------------------------------------- #
+# ResolvedTier backend boundary                                               #
+# --------------------------------------------------------------------------- #
+
+def test_whisper_transcriber_rejects_missing_model_path_before_backend(monkeypatch, tmp_path):
+    """A missing local path is rejected before mlx_whisper is ever called."""
+    backend = _FakeMlxWhisper()
+    _install_fake_mlx_whisper(monkeypatch, backend)
+    source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
+    with pytest.raises(ModelNotProvisionedError):
+        WhisperTranscriber().transcribe(
+            source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path, exists=False)
+        )
+    assert backend.call_count == 0  # backend never invoked
+
+
+def test_whisper_transcriber_rejects_repo_like_path_before_backend(monkeypatch, tmp_path):
+    """A Hugging-Face-repo-like string is not a local file; rejected before backend."""
+    backend = _FakeMlxWhisper()
+    _install_fake_mlx_whisper(monkeypatch, backend)
+    source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
+    repo_tier = ResolvedTier(
+        tier="whisper-small", model_id="whisper-small",
+        model_path=Path("mlx-community/whisper-tiny-mlx"), sha256="0" * 64, quant_format="int4",
+    )
+    with pytest.raises(ModelNotProvisionedError):
+        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), repo_tier)
+    assert backend.call_count == 0
+
+
+def test_whisper_transcriber_rejects_raw_path_not_tier(tmp_path):
+    """The adapter takes a ResolvedTier, never a raw path."""
+    source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
+    with pytest.raises(TypeError):
+        WhisperTranscriber().transcribe(
+            source, ChunkingConfig(chunk_duration_sec=5.0), tmp_path / "not-a-tier"
+        )
+
+
+def test_whisper_transcriber_raises_clear_error_without_mlx_whisper(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "mlx_whisper", None)
     source = ArrayAudioSource(np.zeros(int(5 * 16000), np.float32), 16000)
     with pytest.raises(RuntimeError, match="mlx-whisper"):
-        WhisperTranscriber().transcribe(source, ChunkingConfig(chunk_duration_sec=5.0), Path("/m"))
+        WhisperTranscriber().transcribe(
+            source, ChunkingConfig(chunk_duration_sec=5.0), _tier(tmp_path)
+        )
 
 
 def test_whisper_transcriber_real_smoke_skips_without_backend_or_weights():
     """Real-backend smoke test: runs only when mlx_whisper and a provisioned
-    Whisper model are available; otherwise skips. Logic is covered by the fake
-    tests above."""
+    Whisper model are available; otherwise skips."""
     pytest.importorskip("mlx_whisper")
-    # A real run additionally requires a provisioned model directory; skip if
-    # the user has not provisioned one (see docs/provisioning.md).
     model_dir = Path("models")
     if not (model_dir / "models.json").exists():
         pytest.skip("no provisioned models/ directory for real Whisper smoke test")

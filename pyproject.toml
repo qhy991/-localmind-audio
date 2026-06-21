@@ -13,8 +13,9 @@ dependencies = [
 
 [project.optional-dependencies]
 ml = [
-    # Heavy ML backends, installed when needed by later milestones:
-    # mlx-whisper, mlx-lm
+    # Real STT backend. Apple-silicon only; install on Python 3.11+:
+    #   .venv/bin/python -m pip install -e ".[ml]"
+    "mlx-whisper>=0.1.0",
 ]
 dev = [
     "pytest>=8",

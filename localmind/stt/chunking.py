@@ -14,6 +14,8 @@ backend inference runs.
 
 from __future__ import annotations
 
+import re
+import subprocess
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,8 +23,8 @@ from typing import Iterator, Protocol, runtime_checkable
 
 import numpy as np
 
-from localmind.audio.decode import _bytes_to_float, _resample_linear, _to_mono
-from localmind.audio.errors import DecodeError
+from localmind.audio.decode import _bytes_to_float, _ffmpeg_exe, _resample_linear, _to_mono
+from localmind.audio.errors import DecodeError, DecoderUnavailableError, UnsupportedFormatError
 
 # Audio longer than this must be chunked. Keeps peak decode/buffer memory bounded
 # regardless of total file length.
@@ -185,6 +187,103 @@ def iter_audio_chunks(
         if final:
             break
         t += hop
+
+
+class FFmpegAudioSource:
+    """Windowed source for compressed audio (.m4a/.mp3/.aac) via ffmpeg.
+
+    Reads only the requested window with ``ffmpeg -ss <start> -t <dur> -i <path>
+    -f f32le -ac 1 -ar <rate> -``, so the full file is never decoded into memory.
+    Duration is discovered from ffmpeg metadata probing (no full decode). Each
+    window is returned as mono float32 at ``target_sample_rate``.
+    """
+
+    _COMPRESSED_EXTS = frozenset({"m4a", "mp3", "aac"})
+
+    def __init__(self, path, target_sample_rate: int = 16000):
+        self.path = Path(path)
+        self._target_rate = int(target_sample_rate)
+        self._exe = self._require_ffmpeg()
+        self._duration = self._probe_duration()
+
+    def _require_ffmpeg(self) -> str:
+        exe = _ffmpeg_exe()
+        if exe is None:
+            raise DecoderUnavailableError(
+                f"ffmpeg is not available; cannot create a bounded source for {self.path}"
+            )
+        return exe
+
+    def _probe_duration(self) -> float:
+        # `ffmpeg -i <path>` with no output writes duration to stderr and exits
+        # nonzero; that is expected — we parse the stderr, not the exit code.
+        proc = subprocess.run(
+            [self._exe, "-i", str(self.path)], capture_output=True
+        )
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+        if not m:
+            raise DecodeError(
+                f"could not determine duration of {self.path}; file may be "
+                f"unreadable or not a supported audio container"
+            )
+        hours, minutes, seconds = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        duration = hours * 3600 + minutes * 60 + seconds
+        if duration <= 0:
+            raise DecodeError(f"non-positive duration for {self.path}: {duration}")
+        return duration
+
+    @property
+    def sample_rate(self) -> int:
+        return self._target_rate
+
+    @property
+    def duration_sec(self) -> float:
+        return self._duration
+
+    def read_window(self, start_sec: float, end_sec: float) -> np.ndarray:
+        dur = end_sec - start_sec
+        if dur <= 0:
+            return np.empty(0, dtype=np.float32)
+        start_sec = max(0.0, float(start_sec))
+        cmd = [
+            self._exe,
+            "-loglevel", "error",
+            "-ss", f"{start_sec:.6f}",
+            "-t", f"{dur:.6f}",
+            "-i", str(self.path),
+            "-f", "f32le",
+            "-ac", "1",
+            "-ar", str(self._target_rate),
+            "-",
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True)
+        except OSError as exc:
+            raise DecodeError(f"failed to invoke ffmpeg for {self.path}: {exc}") from exc
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise DecodeError(f"ffmpeg failed for {self.path}: {stderr}")
+        raw = proc.stdout
+        if not raw:
+            return np.empty(0, dtype=np.float32)
+        return np.frombuffer(raw, dtype="<f4").astype(np.float32)
+
+
+def audio_source_from_path(path, target_sample_rate: int = 16000) -> "AudioSource":
+    """Build a bounded audio source appropriate for a file's container.
+
+    ``.wav`` -> :class:`WavAudioSource`; ``.m4a``/``.mp3``/``.aac`` ->
+    :class:`FFmpegAudioSource`; anything else raises
+    :class:`UnsupportedFormatError`. Both sources read only the window asked
+    for, so long-audio transcription never materializes the whole file.
+    """
+    ext = Path(path).suffix.lower().lstrip(".")
+    if ext == "wav":
+        return WavAudioSource(path, target_sample_rate)
+    if ext in FFmpegAudioSource._COMPRESSED_EXTS:
+        return FFmpegAudioSource(path, target_sample_rate)
+    raise UnsupportedFormatError(f"unsupported audio format: .{ext}")
 
 
 def chunk_audio(

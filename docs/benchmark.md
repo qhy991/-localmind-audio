@@ -18,8 +18,9 @@ Three canonical cases, declared in `localmind/bench/fixtures.py`
 **Real audio for these cases is provisioned out-of-band** — exactly like model
 weights (see `docs/provisioning.md`). A 60-minute 16 kHz mono file is ~115 MB
 of PCM and is never committed to git. The harness resolves `audio_rel_path`
-under the benchmark fixtures directory and **skips cleanly** when the file is
-absent, so unit tests remain hermetic.
+under the benchmark fixtures directory and **fails clearly** via
+`require_fixture()` (raising `FixtureNotProvisionedError`) when a required
+fixture is absent, so a real benchmark run cannot silently skip a missing case.
 
 For unit tests that need audio but not the full benchmark corpus, use
 `generate_synthetic_wav(path, duration_sec, ...)` — a deterministic, seeded
