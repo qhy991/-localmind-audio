@@ -249,6 +249,68 @@ def test_ml_extra_contains_both_backends():
 
 
 # --------------------------------------------------------------------------- #
+# Portable partial-backend regression (host-independent)                      #
+# --------------------------------------------------------------------------- #
+
+def _patch_backend_raise(monkeypatch, module_name, exc_cls=RuntimeError,
+                         msg="simulated partial-backend failure"):
+    """Make importing module_name raise exc_cls, delegating all other imports."""
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == module_name:
+            raise exc_cls(msg)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
+def test_transcribe_nonmock_backend_runtime_error_yields_provisioning_error(tmp_path, monkeypatch):
+    """Even if mlx_whisper import raises RuntimeError, a missing model dir
+    must produce provisioning_error — not runtime_error. Host-independent."""
+    _patch_backend_raise(monkeypatch, "mlx_whisper")
+    wav = _wav(tmp_path)
+    rc, out, _ = _run(
+        ["transcribe", str(wav), "--model-dir", str(tmp_path / "no-models")],
+        tmp_path,
+    )
+    assert rc == 1
+    data = json.loads(out)
+    assert data["error"]["code"] == "provisioning_error"
+
+
+def test_analyze_nonmock_backend_runtime_error_yields_provisioning_error(tmp_path, monkeypatch):
+    """Analyze with a partial backend (RuntimeError on import) and missing model
+    dir must still fail with provisioning_error. Host-independent."""
+    _patch_backend_raise(monkeypatch, "mlx_whisper")
+    wav = _wav(tmp_path)
+    rc, out, _ = _run(
+        ["analyze", str(wav), "--model-dir", str(tmp_path / "no-models")],
+        tmp_path,
+    )
+    assert rc == 1
+    data = json.loads(out)
+    assert data["error"]["code"] == "provisioning_error"
+
+
+def test_summarize_nonmock_backend_runtime_error_yields_provisioning_error(tmp_path, monkeypatch):
+    """Summarize with a partial LLM backend (RuntimeError on import) and missing
+    model dir must still fail with provisioning_error. Host-independent."""
+    _patch_backend_raise(monkeypatch, "mlx_lm")
+    segs = [{"id": "seg-0000", "start": 0.0, "end": 1.0, "text": "hello"}]
+    tjson = _transcript_json(tmp_path, segs)
+    rc, out, _ = _run(
+        ["summarize", str(tjson), "--model-dir", str(tmp_path / "no-models"),
+         "--llm-tier", "qwen-7b"],
+        tmp_path,
+    )
+    assert rc == 1
+    data = json.loads(out)
+    assert data["error"]["code"] == "provisioning_error"
+
+
+# --------------------------------------------------------------------------- #
 # summarize non-mock: --model-dir + fake mlx_lm                               #
 # --------------------------------------------------------------------------- #
 
