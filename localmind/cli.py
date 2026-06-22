@@ -92,14 +92,6 @@ def _provenance_to_dict(provenance) -> Optional[dict]:
 def _select_transcriber(args) -> Transcriber:
     if args.mock:
         return MockTranscriber()
-    try:
-        import mlx_whisper  # noqa: F401
-    except ImportError as exc:
-        raise CliError(
-            "mlx-whisper is not installed; pass --mock for an offline contract run, "
-            "or install the ML backend with `pip install -e .[ml]` "
-            "(see docs/provisioning.md)"
-        ) from exc
     return WhisperTranscriber(language=getattr(args, "language", None))
 
 
@@ -215,14 +207,6 @@ def cmd_benchmark(args, out: IO, err: IO) -> int:
 def _select_summary_llm(args) -> SummaryLLM:
     if args.mock:
         return MockSummaryLLM()
-    try:
-        import mlx_lm  # noqa: F401
-    except ImportError:
-        raise CliError(
-            "mlx-lm is not installed; pass --mock for an offline contract run, "
-            "or install the ML backend with `pip install -e .[ml]` "
-            "(see docs/provisioning.md)"
-        )
     return MlxLmSummaryLLM(Provisioner(args.model_dir), args.llm_tier)
 
 

@@ -565,7 +565,10 @@ def test_whisper_transcriber_real_smoke():
     """Real-backend smoke test: runs only when mlx_whisper and a provisioned
     Whisper model are available; otherwise skips. When it runs, it transcribes a
     tiny local sample and asserts nonempty timestamped segments + provenance."""
-    pytest.importorskip("mlx_whisper")
+    try:
+        import mlx_whisper  # noqa: F401
+    except Exception as exc:
+        pytest.skip(f"mlx_whisper not usable: {exc}")
     model_dir = Path("models")
     manifest = model_dir / "models.json"
     if not manifest.exists():

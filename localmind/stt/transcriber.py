@@ -206,6 +206,13 @@ class WhisperTranscriber(Transcriber):
                 "pre-built ResolvedTier or raw path is not accepted"
             )
 
+        # Resolve the tier BEFORE importing the backend: a missing/tampered/
+        # unprovisioned model must fail deterministically here, before any
+        # backend initialization — regardless of whether a partial backend
+        # package happens to be installed.
+        resolved = resolve_tier(provisioner, tier_model_id)
+        self.last_provenance = resolved
+
         try:
             import mlx_whisper
         except ImportError as exc:
@@ -213,13 +220,6 @@ class WhisperTranscriber(Transcriber):
                 "mlx-whisper is not installed; install the ML backend with "
                 "`pip install -e '.[ml]'` (see docs/provisioning.md) before using WhisperTranscriber"
             ) from exc
-
-        # Resolve the tier inside the adapter boundary, immediately before
-        # backend invocation. This re-runs size + SHA-256 verification and
-        # confines the path to the model directory; an unprovisioned or tampered
-        # tier fast-fails here, before mlx_whisper is called.
-        resolved = resolve_tier(provisioner, tier_model_id)
-        self.last_provenance = resolved
 
         duration = source.duration_sec
         chunk_results: List[Tuple[float, List[_RawSegment]]] = []
