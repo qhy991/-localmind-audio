@@ -22,7 +22,8 @@ ASPIRATIONAL_RTF = 0.08
 
 _VALID_STAGES = ("decode", "stt", "llm", "persist")
 _VALID_MEM_METHODS = frozenset(
-    {"resource_tracker", "psutil_rss", "mach_task_basic_info", "metal_allocated", "mlx_memory"}
+    {"resource_tracker", "psutil_rss", "mach_task_basic_info", "metal_allocated",
+     "mlx_memory", "metal_unavailable"}
 )
 
 

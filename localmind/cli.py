@@ -132,14 +132,36 @@ def cmd_transcribe(args, out: IO, err: IO) -> int:
 
 
 def _peak_memory() -> List[PeakMemory]:
-    """Measure CPU RSS; GPU allocation requires the ML backend (reported as 0)."""
+    """Measure CPU RSS and (when available) MLX Metal GPU memory.
+
+    On headless/sandboxed macOS sessions without a Metal device, GPU memory is
+    honestly reported as 0 with method ``metal_unavailable`` rather than a
+    misleading ``metal_allocated`` placeholder.
+    """
     usage = resource.getrusage(resource.RUSAGE_SELF)
     # ru_maxrss is bytes on macOS, kilobytes on Linux.
     rss_bytes = int(usage.ru_maxrss * (1024 if sys.platform.startswith("linux") else 1))
+    gpu_bytes, gpu_method = _try_mlx_gpu_memory()
     return [
         PeakMemory(rss_bytes, "cpu", "resource_tracker"),
-        PeakMemory(0, "gpu", "metal_allocated"),
+        PeakMemory(gpu_bytes, "gpu", gpu_method),
     ]
+
+
+def _try_mlx_gpu_memory():
+    """Try to measure MLX Metal peak GPU memory.
+
+    Returns ``(bytes, method)``: when Metal is available and MLX is installed,
+    returns the measured peak memory via ``mlx.core.metal.get_peak_memory()``
+    with method ``"mlx_memory"``. When Metal is unavailable (headless/sandbox)
+    or MLX is not installed, returns ``(0, "metal_unavailable")``.
+    """
+    try:
+        import mlx.core as mx
+        peak = mx.metal.get_peak_memory()
+        return int(peak), "mlx_memory"
+    except Exception:
+        return 0, "metal_unavailable"
 
 
 def cmd_benchmark(args, out: IO, err: IO) -> int:
