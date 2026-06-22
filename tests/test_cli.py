@@ -236,6 +236,18 @@ def test_cli_summary_schema_version_pinned():
     assert SUMMARY_SCHEMA_VERSION == "soundmind.summary.v1"
 
 
+def test_ml_extra_contains_both_backends():
+    """The ml optional dependency must include both mlx-whisper and mlx-lm."""
+    import tomllib
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with open(pyproject, "rb") as f:
+        data = tomllib.load(f)
+    ml_deps = data["project"]["optional-dependencies"]["ml"]
+    dep_names = [d.split(">=")[0].split("[")[0].strip().lower() for d in ml_deps]
+    assert "mlx-whisper" in dep_names
+    assert "mlx-lm" in dep_names
+
+
 # --------------------------------------------------------------------------- #
 # summarize non-mock: --model-dir + fake mlx_lm                               #
 # --------------------------------------------------------------------------- #

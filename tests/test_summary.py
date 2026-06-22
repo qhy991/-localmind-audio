@@ -346,3 +346,56 @@ def test_mlxlm_llm_rejects_non_llm_kind(tmp_path, monkeypatch):
     with pytest.raises(ModelNotProvisionedError, match="kind"):
         llm.generate("prompt")
     assert len(fake.load_calls) == 0  # mlx_lm.load never called for non-LLM kind
+
+
+def test_mlxlm_llm_wrong_kind_missing_file(tmp_path, monkeypatch):
+    """Kind check happens BEFORE weight hashing: wrong kind + missing file -> kind error."""
+    import hashlib
+    model_dir = tmp_path / "models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    # Manifest declares a whisper-kind entry; the weight file does NOT exist.
+    (model_dir / "models.json").write_text(json.dumps({
+        "schema_version": "1",
+        "models": [{
+            "model_id": "whisper-small", "name": "w", "kind": "whisper",
+            "path": "missing.mlmodel", "quant_format": "int4",
+            "size_bytes": 100, "sha256": hashlib.sha256(b"x").hexdigest(),
+            "license": "MIT",
+        }],
+    }))
+    prov = Provisioner(model_dir)
+    fake = _FakeMlxLm("should not be called")
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake)
+
+    llm = MlxLmSummaryLLM(prov, "whisper-small")
+    with pytest.raises(ModelNotProvisionedError, match="kind"):
+        llm.generate("prompt")
+    assert len(fake.load_calls) == 0
+
+
+def test_mlxlm_llm_wrong_kind_tampered_file(tmp_path, monkeypatch):
+    """Kind check happens BEFORE SHA verification: wrong kind + tampered file -> kind error."""
+    import hashlib
+    model_dir = tmp_path / "models"
+    original = b"whisper-weights" * 100
+    tampered = b"T" * len(original)  # same length, different sha
+    p = model_dir / "whisper-small.mlmodel"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(tampered)
+    (model_dir / "models.json").write_text(json.dumps({
+        "schema_version": "1",
+        "models": [{
+            "model_id": "whisper-small", "name": "w", "kind": "whisper",
+            "path": "whisper-small.mlmodel", "quant_format": "int4",
+            "size_bytes": len(original), "sha256": hashlib.sha256(original).hexdigest(),
+            "license": "MIT",
+        }],
+    }))
+    prov = Provisioner(model_dir)
+    fake = _FakeMlxLm("should not be called")
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake)
+
+    llm = MlxLmSummaryLLM(prov, "whisper-small")
+    with pytest.raises(ModelNotProvisionedError, match="kind"):
+        llm.generate("prompt")
+    assert len(fake.load_calls) == 0

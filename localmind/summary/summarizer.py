@@ -109,16 +109,43 @@ class MockSummaryLLM(SummaryLLM):
         })
 
 
+def _resolve_llm_tier(provisioner: Provisioner, model_id: str) -> ResolvedTier:
+    """Resolve an LLM model tier, checking kind BEFORE weight hashing.
+
+    Unlike the generic :func:`~localmind.stt.transcriber.resolve_tier`, this
+    LLM-specific resolver rejects ``kind != "llm"`` immediately after loading
+    the manifest entry — before ``require_model`` hashes the weight file. A
+    wrong-kind entry with a missing or tampered file produces a kind error, not
+    a missing-weight or checksum error.
+    """
+    manifest = provisioner.load_manifest()
+    try:
+        entry = manifest.by_id(model_id)
+    except KeyError:
+        raise ModelNotProvisionedError(
+            f"model not provisioned: {model_id!r} is not declared in the manifest"
+        ) from None
+    if entry.kind != "llm":
+        raise ModelNotProvisionedError(
+            f"model {model_id!r} has kind={entry.kind!r}, not 'llm'; "
+            f"cannot load as an LLM"
+        )
+    path = provisioner.require_model(model_id)  # verifies size + SHA-256 (AFTER kind)
+    return ResolvedTier(
+        tier=model_id, model_id=model_id, model_path=path,
+        sha256=entry.sha256, quant_format=entry.quant_format, kind=entry.kind,
+    )
+
+
 class MlxLmSummaryLLM(SummaryLLM):
     """Real local LLM adapter over mlx-lm, bound to verified provisioning.
 
     Like :class:`~localmind.stt.WhisperTranscriber`, this adapter owns the
     model-resolution boundary: callers pass a :class:`Provisioner` and a model
-    id, and the adapter calls :func:`resolve_tier` (which runs
-    ``Provisioner.require_model``) on the first ``generate`` call. A pre-built
-    path or repo id is never accepted. After generation,
-    ``self.last_provenance`` holds the :class:`ResolvedTier` for downstream run
-    records.
+    id, and the adapter resolves the tier internally on the first ``generate``
+    call via :func:`_resolve_llm_tier` (which checks ``kind == "llm"`` before
+    hashing, then runs ``require_model`` for size + SHA-256 verification). A
+    pre-built path or repo id is never accepted.
     """
 
     def __init__(self, provisioner: Provisioner, model_id: str, max_tokens: int = 1024):
@@ -136,12 +163,7 @@ class MlxLmSummaryLLM(SummaryLLM):
                 "repo ids are not accepted"
             )
         if self.last_provenance is None:
-            self.last_provenance = resolve_tier(self.provisioner, self.model_id)
-        if self.last_provenance.kind != "llm":
-            raise ModelNotProvisionedError(
-                f"model {self.model_id!r} has kind={self.last_provenance.kind!r}, "
-                f"not 'llm'; cannot load as an LLM"
-            )
+            self.last_provenance = _resolve_llm_tier(self.provisioner, self.model_id)
         try:
             import mlx_lm
         except ImportError as exc:
