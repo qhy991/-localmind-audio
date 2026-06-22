@@ -201,9 +201,10 @@ in the same `ml` extra as `mlx-whisper`. Install both backends with:
 
 `MlxLmSummaryLLM(provisioner, model_id)` resolves the LLM tier through
 `Provisioner.require_model()` (size + SHA-256 + model-dir confinement) and
-additionally enforces that the manifest entry's `kind` is `"llm"` — a Whisper
-entry cannot be loaded as an LLM. A missing or tampered model fast-fails before
-`mlx_lm.load()` is called. The resolved tier is recorded on
+additionally enforces that the manifest entry's `kind` is `"llm"` **before any
+weight file hashing** — a Whisper entry cannot be loaded as an LLM, even if the
+weight file is missing or tampered. A missing or tampered model fast-fails
+before `mlx_lm.load()` is called. The resolved tier is recorded on
 `adapter.last_provenance` for the store's `model_manifest_ref` (model_id, sha256,
 quant_format, path). A pre-built path or Hugging Face repo id is never accepted.
 

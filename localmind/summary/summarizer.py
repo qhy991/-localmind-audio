@@ -30,7 +30,7 @@ from typing import Dict, List, Optional, Tuple
 from localmind.stt.segment import TranscriptSegment
 from localmind.provisioning.provisioner import Provisioner
 from localmind.provisioning.errors import ModelNotProvisionedError
-from localmind.stt.transcriber import resolve_tier, ResolvedTier
+from localmind.stt.transcriber import ResolvedTier
 from localmind.summary.schema import (
     SUMMARY_SCHEMA_VERSION,
     SummaryValidationError,
