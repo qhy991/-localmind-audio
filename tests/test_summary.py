@@ -399,3 +399,23 @@ def test_mlxlm_llm_wrong_kind_tampered_file(tmp_path, monkeypatch):
     with pytest.raises(ModelNotProvisionedError, match="kind"):
         llm.generate("prompt")
     assert len(fake.load_calls) == 0
+
+
+def test_fake_llm_backend_skips_mlx_preflight(tmp_path, monkeypatch):
+    """Host-independent proof: when a fake mlx_lm is injected into sys.modules,
+    MlxLmSummaryLLM.generate must NOT call ensure_mlx_metal_available."""
+    def _preflight_must_not_run():
+        raise AssertionError("ensure_mlx_metal_available called when fake backend is injected")
+
+    monkeypatch.setattr(
+        "localmind.mlx_runtime.ensure_mlx_metal_available", _preflight_must_not_run
+    )
+    prov = _prov_with_llm_model(tmp_path)
+    fake = _FakeMlxLm("a response")
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake)
+
+    llm = MlxLmSummaryLLM(prov, "qwen-7b")
+    result = llm.generate("summarize this")
+    assert result == "a response"
+    assert llm.last_provenance is not None
+    # preflight was NOT called (no AssertionError)

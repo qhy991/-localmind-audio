@@ -593,3 +593,25 @@ def test_whisper_transcriber_real_smoke():
     validate_segments(segments, audio_duration_sec=source.duration_sec)
     assert t.last_provenance is not None
     assert t.last_provenance.model_id == tier
+
+
+def test_fake_backend_skips_mlx_preflight_clean(tmp_path, monkeypatch):
+    """Host-independent proof: when a fake mlx_whisper is injected into
+    sys.modules, WhisperTranscriber.transcribe must NOT call
+    ensure_mlx_metal_available. If it did, the monkeypatched raise would fire."""
+    def _preflight_must_not_run():
+        raise AssertionError("ensure_mlx_metal_available called when fake backend is injected")
+
+    monkeypatch.setattr(
+        "localmind.mlx_runtime.ensure_mlx_metal_available", _preflight_must_not_run
+    )
+    _install_fake_mlx_whisper(monkeypatch, _FakeMlxWhisper())
+
+    prov = _prov_with_model(tmp_path)
+    sr = 16000
+    source = ArrayAudioSource(np.zeros(int(12 * sr), np.float32), sr)
+    segs = WhisperTranscriber().transcribe(
+        source, ChunkingConfig(chunk_duration_sec=5.0, overlap_sec=1.0),
+        prov, "whisper-small",
+    )
+    assert len(segs) >= 1  # preflight was NOT called
