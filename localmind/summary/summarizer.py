@@ -164,6 +164,13 @@ class MlxLmSummaryLLM(SummaryLLM):
             )
         if self.last_provenance is None:
             self.last_provenance = _resolve_llm_tier(self.provisioner, self.model_id)
+
+        # Preflight Metal availability in a subprocess BEFORE importing the
+        # backend, so a Metal-unavailable host fails cleanly without MLX
+        # atexit hooks polluting process stderr.
+        from localmind.mlx_runtime import ensure_mlx_metal_available
+        ensure_mlx_metal_available()
+
         try:
             import mlx_lm
         except ImportError as exc:

@@ -213,6 +213,12 @@ class WhisperTranscriber(Transcriber):
         resolved = resolve_tier(provisioner, tier_model_id)
         self.last_provenance = resolved
 
+        # Preflight Metal availability in a subprocess BEFORE importing the
+        # backend, so a Metal-unavailable host fails with a clean RuntimeError
+        # without registering MLX atexit hooks in this process.
+        from localmind.mlx_runtime import ensure_mlx_metal_available
+        ensure_mlx_metal_available()
+
         try:
             import mlx_whisper
         except ImportError as exc:

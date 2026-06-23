@@ -506,6 +506,13 @@ def main(argv: Optional[List[str]] = None, out: IO = None, err: IO = None) -> in
             "error": {"code": "runtime_error", "message": str(exc)},
         })
         return 1
+    except Exception as exc:
+        _emit_json(out, {
+            "schema_version": CLI_OUTPUT_SCHEMA_VERSION,
+            "command": args.command,
+            "error": {"code": "internal_error", "message": f"{type(exc).__name__}: {exc}"},
+        })
+        return 1
 
 
 if __name__ == "__main__":  # pragma: no cover

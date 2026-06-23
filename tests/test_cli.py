@@ -346,6 +346,77 @@ def test_analyze_mock_stderr_is_pure_jsonl(tmp_path):
             json.loads(line)  # every line must parse as valid JSON
 
 
+def test_transcribe_nonmock_valid_manifest_clean_stderr(tmp_path):
+    """Non-mock transcribe with a valid fake manifest: structured error on
+    stdout, NO uncaught traceback or MLX atexit noise on stderr. Works on both
+    Metal-available (model-loading fails) and Metal-unavailable (preflight
+    fails) hosts."""
+    import subprocess, hashlib
+    REPO = Path(__file__).resolve().parents[1]
+    wav = _wav(tmp_path)
+    model_dir = tmp_path / "models"
+    content = b"fake-whisper" * 50
+    p = model_dir / "whisper-small.mlmodel"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(content)
+    (model_dir / "models.json").write_text(json.dumps({
+        "schema_version": "1",
+        "models": [{
+            "model_id": "whisper-small", "name": "w", "kind": "whisper",
+            "path": "whisper-small.mlmodel", "quant_format": "int4",
+            "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+            "license": "MIT",
+        }],
+    }))
+    proc = subprocess.run(
+        [sys.executable, "-m", "localmind.cli", "transcribe", str(wav),
+         "--model-dir", str(model_dir), "--tier", "whisper-small", "--no-progress"],
+        cwd=str(REPO), capture_output=True, text=True,
+    )
+    assert proc.returncode == 1
+    data = json.loads(proc.stdout)
+    assert "error" in data
+    # stderr must have NO uncaught Python tracebacks or MLX atexit noise.
+    for line in proc.stderr.strip().split("\n"):
+        if line:
+            json.loads(line)
+
+
+def test_summarize_nonmock_valid_llm_manifest_clean_stderr(tmp_path):
+    """Non-mock summarize with a valid fake LLM manifest: structured error on
+    stdout, pure JSONL on stderr. Works on Metal-available and unavailable."""
+    import subprocess, hashlib
+    REPO = Path(__file__).resolve().parents[1]
+    segs = [{"id": "seg-0000", "start": 0.0, "end": 1.0, "text": "hello"}]
+    tjson = tmp_path / "transcript.json"
+    tjson.write_text(json.dumps({"segments": segs}))
+    model_dir = tmp_path / "models"
+    content = b"fake-llm" * 50
+    p = model_dir / "qwen-7b.gguf"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(content)
+    (model_dir / "models.json").write_text(json.dumps({
+        "schema_version": "1",
+        "models": [{
+            "model_id": "qwen-7b", "name": "q", "kind": "llm",
+            "path": "qwen-7b.gguf", "quant_format": "int4",
+            "size_bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+            "license": "Apache-2.0",
+        }],
+    }))
+    proc = subprocess.run(
+        [sys.executable, "-m", "localmind.cli", "summarize", str(tjson),
+         "--model-dir", str(model_dir), "--llm-tier", "qwen-7b"],
+        cwd=str(REPO), capture_output=True, text=True,
+    )
+    assert proc.returncode == 1
+    data = json.loads(proc.stdout)
+    assert "error" in data
+    for line in proc.stderr.strip().split("\n"):
+        if line:
+            json.loads(line)
+
+
 # --------------------------------------------------------------------------- #
 # summarize non-mock: --model-dir + fake mlx_lm                               #
 # --------------------------------------------------------------------------- #
