@@ -72,6 +72,6 @@ document the shape, not the bit-exact content.
 1. Provision models per `docs/provisioning.md` (Whisper small/medium, LLM).
 2. Provision the 10/30/60-min audio fixtures out-of-band.
 3. Run the pipeline against each case (the CLI `benchmark` subcommand, added in
-   a later milestone, drives this).
+   the CLI `benchmark` subcommand, drives this).
 4. The harness emits a validated `BenchmarkReport` JSON per case, comparing
    measured RTF/peak-memory against the aspirational targets.

@@ -131,17 +131,20 @@ def cmd_transcribe(args, out: IO, err: IO) -> int:
     return 0
 
 
-def _peak_memory() -> List[PeakMemory]:
+def _peak_memory(mock: bool = False) -> List[PeakMemory]:
     """Measure CPU RSS and (when available) MLX Metal GPU memory.
 
-    On headless/sandboxed macOS sessions without a Metal device, GPU memory is
-    honestly reported as 0 with method ``metal_unavailable`` rather than a
-    misleading ``metal_allocated`` placeholder.
+    When ``mock`` is True (mock CLI paths), the MLX probe is skipped entirely
+    to avoid importing mlx.core, which registers an atexit hook that can write
+    a Metal RuntimeError to process stderr on headless sessions. Mock paths
+    report GPU memory as ``(0, "metal_unavailable")`` without side effects.
     """
     usage = resource.getrusage(resource.RUSAGE_SELF)
-    # ru_maxrss is bytes on macOS, kilobytes on Linux.
     rss_bytes = int(usage.ru_maxrss * (1024 if sys.platform.startswith("linux") else 1))
-    gpu_bytes, gpu_method = _try_mlx_gpu_memory()
+    if mock:
+        gpu_bytes, gpu_method = 0, "metal_unavailable"
+    else:
+        gpu_bytes, gpu_method = _try_mlx_gpu_memory()
     return [
         PeakMemory(rss_bytes, "cpu", "resource_tracker"),
         PeakMemory(gpu_bytes, "gpu", gpu_method),
@@ -217,7 +220,7 @@ def cmd_benchmark(args, out: IO, err: IO) -> int:
         ],
         total_duration_sec=total,
         rtf=rtf,
-        peak_memory=_peak_memory(),
+        peak_memory=_peak_memory(mock=args.mock),
         model_tiers={"stt": tier},
         hardware={"python": sys.version.split()[0]},
         aspirational_targets={
@@ -284,7 +287,7 @@ def cmd_summarize(args, out: IO, err: IO) -> int:
     return 0
 
 
-def _build_metrics(decode_sec, stt_sec, llm_sec, persist_sec, audio_duration):
+def _build_metrics(decode_sec, stt_sec, llm_sec, persist_sec, audio_duration, mock=False):
     total = decode_sec + stt_sec + llm_sec + persist_sec
     rtf = (total / audio_duration) if audio_duration > 0 else 0.0
     return {
@@ -296,7 +299,7 @@ def _build_metrics(decode_sec, stt_sec, llm_sec, persist_sec, audio_duration):
         ],
         "total_duration_sec": total,
         "rtf": rtf,
-        "peak_memory": [m.to_dict() for m in _peak_memory()],
+        "peak_memory": [m.to_dict() for m in _peak_memory(mock=mock)],
     }
 
 
@@ -344,7 +347,7 @@ def cmd_analyze(args, out: IO, err: IO) -> int:
             decode_sec, stt_sec, llm_sec,
         )
     else:
-        metrics = _build_metrics(decode_sec, stt_sec, llm_sec, 0.0, source.duration_sec)
+        metrics = _build_metrics(decode_sec, stt_sec, llm_sec, 0.0, source.duration_sec, mock=bool(args.mock))
 
     result = {
         "schema_version": CLI_OUTPUT_SCHEMA_VERSION,
@@ -396,7 +399,7 @@ def _persist_run(args, source, segments, stt_provenance, summarizer, summary, ll
     }
 
     def build_metrics(persist_sec, audio_duration):
-        return _build_metrics(decode_sec, stt_sec, llm_sec, persist_sec, audio_duration)
+        return _build_metrics(decode_sec, stt_sec, llm_sec, persist_sec, audio_duration, mock=bool(args.mock))
 
     store = Store(args.store)
     try:

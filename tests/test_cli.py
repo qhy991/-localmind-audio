@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -308,6 +309,41 @@ def test_summarize_nonmock_backend_runtime_error_yields_provisioning_error(tmp_p
     assert rc == 1
     data = json.loads(out)
     assert data["error"]["code"] == "provisioning_error"
+
+
+# --------------------------------------------------------------------------- #
+# Process-level stderr JSONL purity (subprocess tests)                        #
+# --------------------------------------------------------------------------- #
+
+def test_benchmark_mock_no_progress_stderr_is_empty(tmp_path):
+    """Process-level: benchmark --mock --no-progress must have empty stderr
+    (no MLX import noise, no atexit traceback)."""
+    import subprocess
+    REPO = Path(__file__).resolve().parents[1]
+    wav = _wav(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, "-m", "localmind.cli", "benchmark", str(wav),
+         "--mock", "--no-progress", "--chunk-sec", "1", "--overlap-sec", "0.1"],
+        cwd=str(REPO), capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr.strip() == "", f"unexpected stderr noise: {proc.stderr!r}"
+
+
+def test_analyze_mock_stderr_is_pure_jsonl(tmp_path):
+    """Process-level: every stderr line from analyze --mock must be valid JSON."""
+    import subprocess
+    REPO = Path(__file__).resolve().parents[1]
+    wav = _wav(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, "-m", "localmind.cli", "analyze", str(wav),
+         "--mock", "--chunk-sec", "1", "--overlap-sec", "0.1"],
+        cwd=str(REPO), capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    for line in proc.stderr.strip().split("\n"):
+        if line:
+            json.loads(line)  # every line must parse as valid JSON
 
 
 # --------------------------------------------------------------------------- #
