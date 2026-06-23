@@ -152,13 +152,23 @@ def _try_mlx_gpu_memory():
     """Try to measure MLX Metal peak GPU memory.
 
     Returns ``(bytes, method)``: when Metal is available and MLX is installed,
-    returns the measured peak memory via ``mlx.core.metal.get_peak_memory()``
-    with method ``"mlx_memory"``. When Metal is unavailable (headless/sandbox)
-    or MLX is not installed, returns ``(0, "metal_unavailable")``.
+    returns the measured peak memory via ``mx.get_peak_memory()`` (or the legacy
+    ``mx.metal.get_peak_memory()``) with method ``"mlx_memory"``. When Metal is
+    unavailable (headless/sandbox) or MLX is not installed, returns
+    ``(0, "metal_unavailable")``.
+
+    Deprecation warnings from the legacy API are suppressed so they do not
+    contaminate the CLI's JSONL progress stream on stderr.
     """
     try:
+        import warnings
         import mlx.core as mx
-        peak = mx.metal.get_peak_memory()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                peak = mx.get_peak_memory()  # new API (MLX 0.31+)
+            except AttributeError:
+                peak = mx.metal.get_peak_memory()  # legacy API
         return int(peak), "mlx_memory"
     except Exception:
         return 0, "metal_unavailable"

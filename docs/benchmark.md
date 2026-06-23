@@ -41,8 +41,12 @@ Required fields:
 * `rtf` — overall real-time factor = `total_duration_sec / audio_duration_sec`.
 * `peak_memory` — **must include both `cpu` and `gpu` domains**, each with an
   explicit `method` (one of `resource_tracker`, `psutil_rss`,
-  `mach_task_basic_info`, `metal_allocated`, `mlx_memory`). A memory figure
+  `mach_task_basic_info`, `metal_allocated`, `mlx_memory`,
+  `metal_unavailable`). A memory figure
   without a method, or missing a domain, is rejected (AC-6 negative test).
+  The `gpu` domain uses `mlx_memory` when Metal is available (real peak GPU
+  memory via `mx.get_peak_memory()`), or `metal_unavailable` on headless
+  sessions without a Metal device.
 * `aspirational_targets` — the plan's `peak_mem_gb: 6.0` and `rtf: 0.08`,
   recorded for comparison. These are **measure-and-report** targets, not
   pass/fail gates (confirmed user decision: budgets are aspirational).
