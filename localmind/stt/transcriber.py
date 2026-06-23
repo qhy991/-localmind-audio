@@ -213,19 +213,30 @@ class WhisperTranscriber(Transcriber):
         resolved = resolve_tier(provisioner, tier_model_id)
         self.last_provenance = resolved
 
-        # Preflight Metal availability in a subprocess BEFORE importing the
-        # backend, so a Metal-unavailable host fails with a clean RuntimeError
-        # without registering MLX atexit hooks in this process.
-        from localmind.mlx_runtime import ensure_mlx_metal_available
-        ensure_mlx_metal_available()
-
-        try:
-            import mlx_whisper
-        except ImportError as exc:
+        # Import the backend, but avoid polluting the process with MLX atexit
+        # hooks on Metal-unavailable hosts. If a fake backend is already
+        # injected (unit tests), use it directly. If explicitly marked as
+        # unavailable (sys.modules[name] is None), raise. Only run the
+        # subprocess Metal preflight when no module is present at all.
+        import sys as _sys
+        _mod = _sys.modules.get("mlx_whisper")
+        if _mod is not None:
+            mlx_whisper = _mod  # injected fake or already-imported real
+        elif "mlx_whisper" in _sys.modules:
             raise RuntimeError(
                 "mlx-whisper is not installed; install the ML backend with "
                 "`pip install -e '.[ml]'` (see docs/provisioning.md) before using WhisperTranscriber"
-            ) from exc
+            )
+        else:
+            from localmind.mlx_runtime import ensure_mlx_metal_available
+            ensure_mlx_metal_available()
+            try:
+                import mlx_whisper
+            except ImportError as exc:
+                raise RuntimeError(
+                    "mlx-whisper is not installed; install the ML backend with "
+                    "`pip install -e '.[ml]'` (see docs/provisioning.md) before using WhisperTranscriber"
+                ) from exc
 
         duration = source.duration_sec
         chunk_results: List[Tuple[float, List[_RawSegment]]] = []

@@ -165,19 +165,27 @@ class MlxLmSummaryLLM(SummaryLLM):
         if self.last_provenance is None:
             self.last_provenance = _resolve_llm_tier(self.provisioner, self.model_id)
 
-        # Preflight Metal availability in a subprocess BEFORE importing the
-        # backend, so a Metal-unavailable host fails cleanly without MLX
-        # atexit hooks polluting process stderr.
-        from localmind.mlx_runtime import ensure_mlx_metal_available
-        ensure_mlx_metal_available()
-
-        try:
-            import mlx_lm
-        except ImportError as exc:
+        # Import the backend, avoiding MLX atexit pollution on Metal-unavailable
+        # hosts. Skip preflight when a fake/real backend is already injected.
+        import sys as _sys
+        _mod = _sys.modules.get("mlx_lm")
+        if _mod is not None:
+            mlx_lm = _mod  # injected fake or already-imported real
+        elif "mlx_lm" in _sys.modules:
             raise RuntimeError(
                 "mlx-lm is not installed; install the ML backend with "
                 "`pip install -e .[ml]` (see docs/provisioning.md)"
-            ) from exc
+            )
+        else:
+            from localmind.mlx_runtime import ensure_mlx_metal_available
+            ensure_mlx_metal_available()
+            try:
+                import mlx_lm
+            except ImportError as exc:
+                raise RuntimeError(
+                    "mlx-lm is not installed; install the ML backend with "
+                    "`pip install -e .[ml]` (see docs/provisioning.md)"
+                ) from exc
         if self._model is None:
             self._model, self._tokenizer = mlx_lm.load(str(self.last_provenance.model_path))
         return mlx_lm.generate(
