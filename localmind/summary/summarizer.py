@@ -187,7 +187,10 @@ class MlxLmSummaryLLM(SummaryLLM):
                     "`pip install -e .[ml]` (see docs/provisioning.md)"
                 ) from exc
         if self._model is None:
-            self._model, self._tokenizer = mlx_lm.load(str(self.last_provenance.model_path))
+            # mlx_lm.load expects the model directory (containing config.json +
+            # weights); the verified manifest path points to the weights file,
+            # so load its parent directory.
+            self._model, self._tokenizer = mlx_lm.load(str(self.last_provenance.model_path.parent))
         return mlx_lm.generate(
             self._model, self._tokenizer,
             prompt=prompt, max_tokens=self.max_tokens,

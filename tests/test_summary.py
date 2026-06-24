@@ -288,7 +288,10 @@ def test_mlxlm_llm_generates_with_verified_path(tmp_path, monkeypatch):
 
     assert result == "a summary text"
     assert len(fake.load_calls) == 1
-    assert "qwen-7b.gguf" in fake.load_calls[0]
+    # mlx_lm.load receives the model DIRECTORY (containing config + weights),
+    # not the verified weights file itself.
+    assert str(tmp_path) in fake.load_calls[0]
+    assert "qwen-7b.gguf" not in fake.load_calls[0]
     assert llm.last_provenance is not None
     assert llm.last_provenance.model_id == "qwen-7b"
     assert len(llm.last_provenance.sha256) == 64

@@ -246,7 +246,7 @@ class WhisperTranscriber(Transcriber):
                 continue
             result = mlx_whisper.transcribe(
                 np.ascontiguousarray(chunk.samples, dtype=np.float32),
-                path_or_hf_repo=str(resolved.model_path),
+                path_or_hf_repo=str(resolved.model_path.parent),
                 language=self.language,
                 verbose=False,
             )
@@ -254,14 +254,28 @@ class WhisperTranscriber(Transcriber):
             for bs in self._extract_segments(result):
                 start = self._as_float(bs.get("start")) + chunk.start_sec
                 end = self._as_float(bs.get("end")) + chunk.start_sec
+                # Clamp to audio duration: real backends can emit a final
+                # segment whose end slightly exceeds the true audio length.
+                start = min(start, duration)
+                end = min(end, duration)
                 text = str(bs.get("text", "")).strip()
+                if end <= start:
+                    continue  # skip degenerate trailing segment after clamp
                 raw_segs.append((start, end, text))
             chunk_results.append((chunk.start_sec, raw_segs))
             if on_progress is not None:
                 progress = (chunk.start_sec + chunk.samples.size / chunk.sample_rate) / duration
                 on_progress(min(1.0, progress if duration > 0 else 1.0))
 
-        return merge_chunk_segments(chunk_results, config, duration)
+        merged = merge_chunk_segments(chunk_results, config, duration)
+        # Clamp end timestamps to audio duration: real backends (e.g. mlx_whisper)
+        # can emit a final segment whose end slightly exceeds the true audio
+        # length (e.g. 16.20s for a 16.10s clip). Clamp so validate_segments does
+        # not reject an otherwise-correct transcript.
+        for seg in merged:
+            if seg.end > duration:
+                seg.end = float(duration)
+        return merged
 
     @staticmethod
     def _extract_segments(result) -> list:
