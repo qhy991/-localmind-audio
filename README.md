@@ -28,27 +28,62 @@ runtime download.
 
 ## Why
 
-Cloud STT/LLM tools leak meeting content, charge subscriptions, and stop
-working offline. LocalMind Audio is built for the case where the audio is
-sensitive (commercial discussions, medical, legal) and the machine has a GPU
-sitting idle. It uses [MLX](https://github.com/ml-explore/mlx) to drive the
-Apple-Silicon unified memory directly, so inference is fast and nothing leaves
-the process.
+There is no shortage of local STT (whisper.cpp) or local LLM (Ollama, LM Studio)
+tools. They are **parts**. LocalMind Audio is a **complete pipeline** where the
+"local / trustworthy" property is an enforced, tested contract — not a setting,
+and not a marketing claim.
 
-**Guarantees baked into the design:**
+**Two pillars that make it different:**
 
-- **Zero-network runtime.** The pipeline is verified to succeed with the
-  network socket layer blocked. A missing or tampered model fails fast with an
-  explicit error — it never silently reaches for the network.
-- **Integrity-pinned models.** Every weight is pinned by SHA-256 + size in a
-  manifest and re-verified inside the adapter boundary, immediately before use.
-- **Structured, grounded output.** Summaries conform to a versioned JSON schema;
-  every decision/action cites a transcript segment id. Invalid LLM output goes
-  through bounded repair and, if still invalid, is persisted as a
-  `summary_failed` artifact rather than fabricated.
-- **Single normalized store.** All artifacts (audio metadata, transcript,
-  summary, metrics, model provenance) land in one SQLite database in a single
-  atomic transaction, with referential integrity.
+1. **Verifiable privacy.** This is not "we promise not to upload." The pipeline
+   is proven to run with the network socket layer *blocked*
+   (`tests/test_no_network.py` locks `socket` / `create_connection` /
+   `getaddrinfo` and the pipeline still succeeds). A missing model fails locally
+   with `provisioning_error` — it physically cannot reach the network at runtime.
+   For sensitive audio (legal, medical, journalism, research, executive),
+   "I can prove this recording never left this machine" is the value.
+
+2. **Anti-supply-chain + anti-hallucination, built into the architecture.**
+   Every weight is re-verified by SHA-256 + size *inside the adapter boundary,
+   immediately before each inference* — not just once at download. Model
+   poisoning or local tampering is caught before the weight is used. And every
+   summary is *grounded*: each decision/action cites a transcript segment id;
+   when the LLM produces garbage, bounded repair runs and, on failure, a
+   `summary_failed` artifact is persisted — **never fabrication**.
+
+**How those pillars are enforced (the evidence):**
+
+- **Zero-network runtime.** Verified by the socket-layer harness.
+- **Integrity-pinned models.** SHA-256 + size manifest, re-verified in the
+  adapter, paths confined to the model directory (no absolute paths, no `..`).
+- **Structured, grounded output.** Versioned JSON schema; citations back to
+  segments; bounded repair → `summary_failed` instead of made-up content.
+- **Single normalized store.** Audio metadata, transcript, summary, metrics, and
+  model provenance land in one SQLite database in a single atomic transaction,
+  with referential integrity.
+
+---
+
+## Who is this for
+
+- **Privacy-sensitive professions** — lawyers, doctors, journalists,
+  researchers, executives, activists — who cannot send audio to a cloud STT/LLM
+  and need to *prove* it stayed local.
+- **Developers building local-AI products on Apple Silicon** — this is a stable,
+  tested foundation (the CLI/JSONL contract is the boundary) you can wrap in a
+  UI instead of re-deriving the provisioning / zero-network / grounding rules.
+- **Anyone who distrusts cloud AI** — run your own transcription + summary with
+  models you pinned and audited.
+- **Compliance & security researchers** — an auditable, reproducible on-device
+  AI pipeline sample where the trust properties are testable, not asserted.
+
+> **Honest note on model quality.** The default models (`whisper-tiny` +
+> `Qwen3.5-0.8B`) are **smoke-tier** — they prove the pipeline runs and the
+> contracts hold, but Chinese transcription lands as Traditional characters
+> with small errors and the small LLM follows the schema imperfectly. The
+> **architecture and contracts are the reusable part**; swap in
+> `whisper-base`/`medium` and `Qwen3-1.7B`/`7B` (see
+> [Model provisioning](#model-provisioning)) for production-quality output.
 
 ---
 
@@ -213,6 +248,55 @@ rather than attempting a download.
 
 See [docs/benchmark.md](docs/benchmark.md) for the benchmark methodology and
 report schema.
+
+---
+
+## Roadmap
+
+The contract (zero-network, integrity-pinned, grounded, normalized store) is
+fixed. Features are additive on top of it. Roughly ordered by impact:
+
+**Quality — swap the models, not the pipeline**
+- Larger STT tiers (`whisper-base` / `medium` / `large-v3`) via the
+  `--stt` flag in the provisioning script — better Chinese, fewer errors.
+- Larger / specialized LLM tiers (`Qwen3-1.7B` / `7B`) for reliable schema
+  adherence.
+- Word-level timestamps for finer-grained citations.
+- Auto language detection + multi-language transcripts.
+
+**Pipeline features (currently deferred)**
+- VAD (voice activity detection) — skip silence, segment on speech.
+- Speaker diarization — "who said what."
+- Hot-words / custom vocabulary boost for domain terms.
+- Streaming / real-time incremental transcription.
+- Audio preprocessing (denoising, normalization).
+
+**Interface & output**
+- Swift/SwiftUI native app (file picker, live progress, runs DB browser) over
+  the stable CLI/JSONL contract.
+- Batch processing of many files.
+- Live recording (not just file import).
+- Export to Markdown / PDF / `.docx` meeting minutes; SRT/VTT subtitles.
+- More prompt templates — interview, lecture, standup — not just meeting minutes.
+
+**Retrieve & reuse the archive**
+- Full-text search across stored transcripts.
+- RAG over past transcripts ("what did we decide about X last quarter?").
+- Calendar integration — auto-attach a summary to the meeting that produced it.
+
+**Platform**
+- iOS / iPadOS port (CoreML Whisper + on-device LLM).
+- Linux / Windows support via whisper.cpp + llama.cpp backends behind the same
+  adapter interface.
+- Optional local-server mode (still no outbound network) for a browser UI.
+
+**Trust & ops**
+- Signed manifests / model provenance attestation.
+- Local audit log of every run.
+- Quantization A/B harness (compare 4-bit vs 8-bit quality + speed).
+
+See [Limitations & scope](#limitations--scope) for what is deliberately *not*
+planned for the lower bound, and open an issue to discuss anything above.
 
 ---
 
