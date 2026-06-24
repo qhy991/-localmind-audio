@@ -220,12 +220,20 @@ def _build_map_prompt(chunk: List[TranscriptSegment]) -> str:
     lines = ["Transcript segments (id | start-end | text):"]
     for s in chunk:
         lines.append(f"{s.id} | {s.start:.3f}-{s.end:.3f} | {s.text}")
+    # NOTE: the schema example uses a placeholder id (not a real seg-NNNN) so it
+    # cannot pollute callers that extract segment ids from this prompt.
     lines.append(
         "Produce a JSON object with keys decisions, action_items, open_questions. "
-        "Each item has 'text' (non-empty) and 'citations' (non-empty list of "
-        "segment ids, formatted 'seg:<id>' using only the ids above). "
-        "action_items also have 'owner' (string or null) and 'due_date' "
-        "(YYYY-MM-DD or null). Output ONLY the JSON object."
+        "Each item is an OBJECT (not a string). Output ONLY this exact shape:\n"
+        '{\n'
+        '  "decisions": [{"text": "...", "citations": ["seg:<ID>"]}],\n'
+        '  "action_items": [{"text": "...", "owner": "name or null", '
+        '"due_date": "YYYY-MM-DD or null", "citations": ["seg:<ID>"]}],\n'
+        '  "open_questions": [{"text": "...", "citations": ["seg:<ID>"]}]\n'
+        '}\n'
+        "Rules: 'text' is non-empty; 'citations' is a non-empty list of segment "
+        "ids from above (format 'seg:<id>'); every decision and action_item is "
+        "an object with 'text' and 'citations'. Do not wrap in markdown."
     )
     return "\n".join(lines)
 
@@ -242,13 +250,66 @@ def _build_reduce_prompt(partials: List[Dict], all_segments: List[TranscriptSegm
     return "\n".join(lines)
 
 
+def _strip_to_json_object(raw: str) -> Optional[str]:
+    """Extract the outermost JSON object from a raw LLM string.
+
+    Real LLMs (especially Qwen3 thinking models) wrap JSON in chat scaffolding:
+    a leading ``<think>...</think>`` block, prose preambles, and trailing
+    chat tokens (``<|endoftext|>``, ``<|im_start|>``). This strips those and
+    returns the substring from the first ``{`` to its matching ``}``, or
+    ``None`` if no balanced object is found.
+    """
+    import re
+    s = raw
+    # Drop thinking/reasoning wrappers entirely.
+    s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL)
+    s = re.sub(r"<think>.*$", "", s, flags=re.DOTALL)  # unterminated think
+    # Truncate at the first chat turn boundary (repeated answers).
+    for stop in ("<|endoftext|>", "<|im_start|>", "<|im_end|>"):
+        if stop in s:
+            s = s.split(stop)[0]
+    # Find the first balanced {...} object.
+    start = s.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i + 1]
+    return None
+
+
 def _parse_and_validate_sections(
     raw: str, segments
 ) -> Tuple[Optional[Dict], List[str]]:
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        return None, [f"output is not valid JSON: {exc}"]
+    candidate = _strip_to_json_object(raw)
+    if candidate is not None:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            return None, [f"output is not valid JSON: {exc}"]
+    else:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return None, [f"output is not valid JSON: {exc}"]
     try:
         validate_summary_sections(data, segments)
     except SummaryValidationError as exc:
