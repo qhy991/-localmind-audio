@@ -564,11 +564,18 @@ def test_whisper_transcriber_raises_clear_error_without_mlx_whisper(monkeypatch,
 def test_whisper_transcriber_real_smoke():
     """Real-backend smoke test: runs only when mlx_whisper and a provisioned
     Whisper model are available; otherwise skips. When it runs, it transcribes a
-    tiny local sample and asserts nonempty timestamped segments + provenance."""
-    try:
-        import mlx_whisper  # noqa: F401
-    except Exception as exc:
-        pytest.skip(f"mlx_whisper not usable: {exc}")
+    tiny local sample and asserts nonempty timestamped segments + provenance.
+
+    The mlx_whisper availability check runs in a subprocess so the MLX atexit
+    hook does not pollute the pytest process stderr.
+    """
+    import subprocess as _subprocess
+    _probe = _subprocess.run(
+        [sys.executable, "-c", "import mlx_whisper"],
+        capture_output=True, text=True,
+    )
+    if _probe.returncode != 0:
+        pytest.skip(f"mlx_whisper not usable: {_probe.stderr.strip()[-200:]}")
     model_dir = Path("models")
     manifest = model_dir / "models.json"
     if not manifest.exists():

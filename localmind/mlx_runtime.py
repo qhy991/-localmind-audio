@@ -18,19 +18,25 @@ def ensure_mlx_metal_available() -> None:
     """Verify that MLX Metal is usable via a subprocess preflight.
 
     Runs a tiny ``mx.eval(mx.zeros((1,)))`` in a child process. If the child
-    exits nonzero (Metal unavailable, MLX not installed, etc.), raises
-    ``RuntimeError`` with a clear message. The parent process never imports
-    ``mlx.core``, so no atexit hook is registered.
+    exits nonzero, raises ``RuntimeError`` with a message that distinguishes
+    "MLX not installed" from "Metal device unavailable". The parent process
+    never imports ``mlx.core``, so no atexit hook is registered.
 
     Raises
     ------
     RuntimeError
-        If the subprocess cannot verify Metal availability.
+        If MLX is not installed or the Metal device is unavailable.
     """
     code = (
-        "import mlx.core as mx; "
-        "mx.eval(mx.zeros((1,))); "
-        "print('ok')"
+        "try:\n"
+        "    import mlx.core as mx\n"
+        "except ImportError:\n"
+        "    print('NOT_INSTALLED'); raise SystemExit(1)\n"
+        "try:\n"
+        "    mx.eval(mx.zeros((1,)))\n"
+        "    print('ok')\n"
+        "except Exception as exc:\n"
+        "    print(f'METAL_ERROR:{exc}'); raise SystemExit(2)\n"
     )
     try:
         proc = subprocess.run(
@@ -43,9 +49,20 @@ def ensure_mlx_metal_available() -> None:
         raise RuntimeError(f"MLX Metal preflight failed to execute: {exc}") from exc
 
     if proc.returncode != 0:
+        stdout = proc.stdout.strip()
+        if "NOT_INSTALLED" in stdout:
+            raise RuntimeError(
+                "MLX is not installed; install the ML backend with "
+                "`pip install -e .[ml]` (see docs/provisioning.md)"
+            )
+        if "METAL_ERROR" in stdout:
+            detail = stdout.split("METAL_ERROR:")[-1].strip() if "METAL_ERROR:" in stdout else "unknown"
+            raise RuntimeError(
+                f"MLX Metal device unavailable — backend cannot run in this session. "
+                f"Detail: {detail}"
+            )
         stderr = proc.stderr.strip()
         detail = stderr.split("\n")[-1] if stderr else "unknown error"
         raise RuntimeError(
-            f"MLX Metal device unavailable — backend cannot run in this session. "
-            f"Detail: {detail}"
+            f"MLX Metal preflight failed (rc={proc.returncode}). Detail: {detail}"
         )
