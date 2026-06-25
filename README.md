@@ -100,6 +100,7 @@ and not a marketing claim.
 | Offline model provisioning (SHA-256/size) | ✅ verified |
 | Per-stage metrics + real MLX GPU memory | ✅ verified |
 | Voice activity detection (energy VAD, skip silence) | ✅ verified (no model needed) |
+| VAD-driven smart chunking (`--vad`, skip dead air) | ✅ verified |
 | Swift/SwiftUI native wrapper (M3) | 🚧 not yet (Python CLI is the stable contract) |
 
 The Python pipeline (M0–M2) is complete and tested. The optional native

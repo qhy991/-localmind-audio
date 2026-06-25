@@ -38,6 +38,12 @@ class ChunkingConfig:
     chunk_duration_sec: float = 30.0
     overlap_sec: float = 1.0
     enabled: bool = True
+    # When True, chunk boundaries follow detected speech (VAD): pure-silence
+    # regions are skipped entirely (never transcribed) and chunks split at
+    # speech boundaries instead of mid-utterance. See iter_vad_chunks.
+    use_vad: bool = False
+    # Optional VAD tuning; only used when use_vad is True. Defaults to VadConfig().
+    vad_config: "object | None" = None
 
     def __post_init__(self):
         if self.chunk_duration_sec <= 0:
@@ -187,6 +193,99 @@ def iter_audio_chunks(
         if final:
             break
         t += hop
+
+
+def iter_vad_chunks(
+    source: AudioSource,
+    config: ChunkingConfig = ChunkingConfig(),
+) -> Iterator[AudioChunk]:
+    """Yield speech-aligned chunks, skipping silence regions (VAD-driven).
+
+    Unlike :func:`iter_audio_chunks` (fixed windows), this scans the source for
+    speech and forms chunks that:
+
+    * start/end at speech boundaries — never cut mid-utterance;
+    * skip pure-silence regions longer than ``VadConfig.min_silence_sec``
+      entirely (those spans are never read or transcribed, so dead air costs
+      nothing);
+    * keep continuous audio within a chunk (short pauses inside an utterance
+      are preserved so the backend's timestamps stay correct);
+    * span at most ``chunk_duration_sec`` of wall-clock audio.
+
+    Peak memory stays bounded: the source is scanned in VAD windows (never the
+    whole file at once), and only one chunk's samples are read per yield.
+    """
+    from localmind.vad import VadConfig, detect_speech
+
+    vcfg = config.vad_config if config.vad_config is not None else VadConfig()
+    duration = source.duration_sec
+    chunk_max = config.chunk_duration_sec
+    # VAD scan window: large enough to estimate a noise floor and cover a few
+    # chunks, small enough to keep peak memory bounded for long files.
+    vad_window = max(chunk_max * 4.0, 120.0)
+
+    carried = None  # in-progress chunk span [start, end] in file time
+    w_start = 0.0
+    while w_start < duration - 1e-9:
+        w_end = min(w_start + vad_window, duration)
+        win = source.read_window(w_start, w_end)
+        segs = detect_speech(win, source.sample_rate, vcfg)
+        intervals = [(w_start + s.start_sec, w_start + s.end_sec) for s in segs]
+        # Slice any single speech interval longer than the budget into
+        # budget-sized spans: a single utterance longer than the chunk budget
+        # must be cut somewhere, and we cut at time boundaries (like fixed
+        # chunking) rather than mid-word at a VAD boundary that doesn't exist.
+        sliced = []
+        for s, e in intervals:
+            while e - s > chunk_max + 1e-9:
+                sliced.append((s, s + chunk_max))
+                s = s + chunk_max
+            sliced.append((s, e))
+        intervals = sliced
+
+        cur = carried
+        completed = []
+        for s, e in intervals:
+            if cur is None:
+                cur = [s, e]
+            else:
+                gap = s - cur[1]
+                span_with = e - cur[0]
+                # Extend the chunk when the gap to the next speech is small
+                # (a pause inside one utterance) AND the total span stays under
+                # the budget. Otherwise close the chunk and start a new one.
+                if gap <= vcfg.min_silence_sec and span_with <= chunk_max:
+                    cur[1] = e
+                else:
+                    completed.append((cur[0], cur[1]))
+                    cur = [s, e]
+        carried = cur
+
+        window_final = w_end >= duration - 1e-9
+        if window_final:
+            tail = list(completed)
+            if carried is not None:
+                tail.append((carried[0], carried[1]))
+            for i, (cs, ce) in enumerate(tail):
+                yield AudioChunk(cs, source.read_window(cs, ce),
+                                 source.sample_rate, i == len(tail) - 1)
+            return
+        for cs, ce in completed:
+            yield AudioChunk(cs, source.read_window(cs, ce),
+                             source.sample_rate, False)
+        w_start = w_end
+
+
+def iter_chunks(
+    source: AudioSource,
+    config: ChunkingConfig = ChunkingConfig(),
+) -> Iterator[AudioChunk]:
+    """Dispatch to :func:`iter_vad_chunks` when ``config.use_vad`` is set, else
+    :func:`iter_audio_chunks`. This is the entry point adapters should use."""
+    if config.use_vad:
+        yield from iter_vad_chunks(source, config)
+    else:
+        yield from iter_audio_chunks(source, config)
 
 
 class FFmpegAudioSource:

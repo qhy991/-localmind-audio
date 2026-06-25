@@ -30,7 +30,7 @@ import numpy as np
 
 from localmind.provisioning.errors import ModelNotProvisionedError
 from localmind.provisioning.provisioner import Provisioner
-from localmind.stt.chunking import AudioSource, ChunkingConfig, iter_audio_chunks
+from localmind.stt.chunking import AudioSource, ChunkingConfig, iter_audio_chunks, iter_chunks
 from localmind.stt.segment import TranscriptSegment, validate_segments
 
 ProgressCallback = Callable[[float], None]
@@ -240,7 +240,7 @@ class WhisperTranscriber(Transcriber):
 
         duration = source.duration_sec
         chunk_results: List[Tuple[float, List[_RawSegment]]] = []
-        for chunk in iter_audio_chunks(source, config):
+        for chunk in iter_chunks(source, config):
             if chunk.samples.size == 0:
                 chunk_results.append((chunk.start_sec, []))
                 continue
@@ -267,7 +267,13 @@ class WhisperTranscriber(Transcriber):
                 progress = (chunk.start_sec + chunk.samples.size / chunk.sample_rate) / duration
                 on_progress(min(1.0, progress if duration > 0 else 1.0))
 
-        merged = merge_chunk_segments(chunk_results, config, duration)
+        # VAD chunks split at speech boundaries with no overlap, so merge with
+        # overlap=0 (the config.overlap_sec is for fixed-window chunking).
+        merge_config = config
+        if config.use_vad and config.overlap_sec > 0:
+            from dataclasses import replace as _replace
+            merge_config = _replace(config, overlap_sec=0.0)
+        merged = merge_chunk_segments(chunk_results, merge_config, duration)
         # Clamp end timestamps to audio duration: real backends (e.g. mlx_whisper)
         # can emit a final segment whose end slightly exceeds the true audio
         # length (e.g. 16.20s for a 16.10s clip). Clamp so validate_segments does

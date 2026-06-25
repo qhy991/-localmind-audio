@@ -31,6 +31,8 @@ from localmind.stt import (
     WhisperTranscriber,
     audio_source_from_path,
     iter_audio_chunks,
+    iter_chunks,
+    iter_vad_chunks,
     resolve_tier,
     validate_segments,
 )
@@ -184,6 +186,107 @@ def test_invalid_chunking_config_rejected():
         ChunkingConfig(chunk_duration_sec=0)
     with pytest.raises(ValueError):
         ChunkingConfig(overlap_sec=5.0, chunk_duration_sec=5.0)
+
+
+# --------------------------------------------------------------------------- #
+# VAD-driven chunking                                                          #
+# --------------------------------------------------------------------------- #
+
+def _tone(sec, amp=0.3):
+    return (np.sin(2 * np.pi * 440 * np.arange(int(sec * 16000)) / 16000) * amp).astype(np.float32)
+
+
+def _sil(sec):
+    return np.zeros(int(sec * 16000), dtype=np.float32)
+
+
+def _chunk_spans(chunks):
+    """[(start, end_seconds)] for each chunk in file time."""
+    out = []
+    for c in chunks:
+        out.append((c.start_sec, c.start_sec + c.samples.size / c.sample_rate))
+    return out
+
+
+def test_vad_chunking_skips_silence():
+    # 2s speech | 5s silence | 2s speech | 8s silence | 2s speech (19s)
+    x = np.concatenate([_tone(2), _sil(5), _tone(2), _sil(8), _tone(2)])
+    src = ArrayAudioSource(x, 16000)
+    cfg = ChunkingConfig(chunk_duration_sec=30, overlap_sec=0, use_vad=True)
+    chunks = list(iter_vad_chunks(src, cfg))
+    spans = _chunk_spans(chunks)
+    assert len(chunks) == 3
+    # Each chunk ~2s of speech; the big silences (5s, 8s) are skipped.
+    assert all(1.5 <= (e - s) <= 2.5 for s, e in spans)
+    # Total audio sent to the backend is only the ~6s of speech, not 19s.
+    assert sum(e - s for s, e in spans) < 8.0
+
+
+def test_vad_chunking_respects_duration_budget():
+    # Two 20s speech bursts with a small gap (under min_silence, so they would
+    # merge) but together exceed the 30s chunk budget -> the budget forces a
+    # split. The synthetic tone has little silence, so use a low noise percentile
+    # (the default 10 is tuned for real recordings with more silence).
+    from localmind.vad import VadConfig
+    x = np.concatenate([_sil(1), _tone(20), _sil(0.2), _tone(20)])
+    src = ArrayAudioSource(x, 16000)
+    cfg = ChunkingConfig(chunk_duration_sec=30, overlap_sec=0, use_vad=True,
+                         vad_config=VadConfig(noise_percentile=1.0))
+    spans = _chunk_spans(list(iter_vad_chunks(src, cfg)))
+    assert len(spans) >= 1
+    # No chunk spans more than the 30s budget.
+    assert all((e - s) <= 30.0 + 1e-6 for s, e in spans)
+    # The two 20s bursts cannot both fit in one 30s chunk -> at least 2 chunks.
+    assert len(spans) >= 2
+
+
+def test_vad_chunking_chunks_are_non_overlapping_and_ascending():
+    x = np.concatenate([_sil(1), _tone(2), _sil(3), _tone(2), _sil(1), _tone(2)])
+    src = ArrayAudioSource(x, 16000)
+    cfg = ChunkingConfig(chunk_duration_sec=30, overlap_sec=0, use_vad=True)
+    spans = _chunk_spans(list(iter_vad_chunks(src, cfg)))
+    for (s1, e1), (s2, _e2) in zip(spans, spans[1:]):
+        assert e1 <= s2  # non-overlapping, ascending
+
+
+def test_vad_chunking_no_speech_yields_nothing():
+    src = ArrayAudioSource(_sil(10), 16000)
+    cfg = ChunkingConfig(chunk_duration_sec=30, overlap_sec=0, use_vad=True)
+    assert list(iter_vad_chunks(src, cfg)) == []
+
+
+def test_vad_chunking_marks_final_flag_on_last_chunk():
+    x = np.concatenate([_tone(2), _sil(3), _tone(2)])
+    src = ArrayAudioSource(x, 16000)
+    cfg = ChunkingConfig(chunk_duration_sec=30, overlap_sec=0, use_vad=True)
+    chunks = list(iter_vad_chunks(src, cfg))
+    assert chunks[-1].final is True
+    assert all(c.final is False for c in chunks[:-1])
+
+
+def test_iter_chunks_dispatches_on_use_vad():
+    x = np.concatenate([_tone(2), _sil(5), _tone(2)])
+    src = ArrayAudioSource(x, 16000)
+    fixed = list(iter_chunks(src, ChunkingConfig(chunk_duration_sec=30, overlap_sec=0)))
+    vad = list(iter_chunks(src, ChunkingConfig(chunk_duration_sec=30, overlap_sec=0, use_vad=True)))
+    # Fixed chunking covers the whole 9s; VAD chunking skips the 5s silence.
+    assert sum(c.samples.size / c.sample_rate for c in fixed) > \
+           sum(c.samples.size / c.sample_rate for c in vad)
+
+
+def test_vad_chunking_real_sample_runs():
+    from pathlib import Path
+    sample = Path("audio/sample-zh.wav")
+    if not sample.exists():
+        pytest.skip("no audio/sample-zh.wav fixture")
+    src = audio_source_from_path(str(sample), target_sample_rate=16000)
+    cfg = ChunkingConfig(chunk_duration_sec=30, overlap_sec=0, use_vad=True)
+    chunks = list(iter_vad_chunks(src, cfg))
+    assert len(chunks) >= 1
+    # VAD chunking should send less audio than the full duration (there is
+    # silence in the clip).
+    sent = sum(c.samples.size / c.sample_rate for c in chunks)
+    assert sent <= src.duration_sec
 
 
 def test_wav_audio_source_reads_only_window(tmp_path):

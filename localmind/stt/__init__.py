@@ -20,6 +20,8 @@ from localmind.stt.chunking import (
     audio_source_from_path,
     chunk_audio,
     iter_audio_chunks,
+    iter_chunks,
+    iter_vad_chunks,
 )
 from localmind.stt.segment import TranscriptSegment, validate_segments
 from localmind.stt.transcriber import (
@@ -41,6 +43,8 @@ __all__ = [
     "audio_source_from_path",
     "chunk_audio",
     "iter_audio_chunks",
+    "iter_chunks",
+    "iter_vad_chunks",
     "TranscriptSegment",
     "validate_segments",
     "MockTranscriber",

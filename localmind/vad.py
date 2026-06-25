@@ -128,14 +128,15 @@ def detect_speech(
     safe = np.maximum(energies, cfg.floor_rms)
     db = 20.0 * np.log10(safe)
 
-    noise_db = float(np.percentile(db, cfg.noise_percentile))
-    peak_db = float(db.max())
-    # If the recording has little dynamic range (peak barely above the noise
-    # floor, e.g. near-silent audio), there is no speech to find. Detect via the
-    # gap between peak and floor: a real recording has speech well above the
-    # silence floor; a flat/near-silent one does not.
-    if peak_db - noise_db < cfg.speech_rise_db:
+    # Noise floor = low percentile of per-frame energy (the quiet frames).
+    # A low default percentile captures silence even in fairly talky audio.
+    low_db = float(np.percentile(db, cfg.noise_percentile))
+    high_db = float(np.percentile(db, 100.0 - cfg.noise_percentile))
+    # Flat signals (pure tone, pure silence) have almost no dynamic range and
+    # therefore no measurable background vs. speech — there is nothing to detect.
+    if high_db - low_db < cfg.speech_rise_db:
         return []
+    noise_db = low_db
     rise = noise_db + cfg.speech_rise_db
     fall = noise_db + cfg.speech_fall_db
 

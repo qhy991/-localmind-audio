@@ -164,6 +164,23 @@ Use cases: estimate how much of a long recording is actual talk before
 transcribing, locate the talk to skip dead air, or feed the speech intervals
 into downstream segmentation.
 
+### Driving transcription with VAD (`--vad`)
+
+Add `--vad` to `transcribe` / `benchmark` / `analyze` and chunking follows speech
+instead of fixed time windows: pure-silence regions are skipped entirely (never
+decoded or transcribed) and chunks split at speech boundaries instead of
+mid-utterance. On audio with lots of dead air this is both faster and cleaner:
+
+```bash
+localmind analyze meeting.m4a --model-dir models --tier whisper-tiny --language zh \
+    --llm-tier qwen3.5-0.8b --vad --store runs.db
+```
+
+Internally the source is still scanned in bounded windows (peak memory does not
+scale with file length); only the spoken spans are read into chunks. Long
+continuous speech that exceeds `--chunk-sec` is still split at time boundaries
+(a single utterance longer than the chunk budget has to be cut somewhere).
+
 ---
 
 ## Common flags
@@ -175,6 +192,7 @@ into downstream segmentation.
 | `--llm-tier ID` | summarize/analyze | LLM tier `model_id` |
 | `--language CODE` | transcribe/benchmark/analyze | spoken-language hint |
 | `--chunk-sec N` | STT commands | chunk length in seconds |
+| `--vad` | STT commands | VAD-driven chunking: skip silence and split chunks at speech boundaries (faster on talky-with-gaps audio) |
 | `--overlap-sec N` | STT commands | overlap between chunks (smoother segment merge) |
 | `--mock` | all | run the full contract **without** any backend (offline smoke) |
 | `--no-progress` | all | silence JSONL progress on stderr |

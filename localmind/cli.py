@@ -102,7 +102,8 @@ def cmd_transcribe(args, out: IO, err: IO) -> int:
         raise CliError(f"cannot open audio source {args.audio}: {exc}") from exc
 
     config = ChunkingConfig(
-        chunk_duration_sec=args.chunk_sec, overlap_sec=args.overlap_sec
+        chunk_duration_sec=args.chunk_sec, overlap_sec=args.overlap_sec,
+        use_vad=bool(args.vad),
     )
     transcriber = _select_transcriber(args)
     provisioner = None if args.mock else Provisioner(args.model_dir)
@@ -179,7 +180,8 @@ def _try_mlx_gpu_memory():
 
 def cmd_benchmark(args, out: IO, err: IO) -> int:
     config = ChunkingConfig(
-        chunk_duration_sec=args.chunk_sec, overlap_sec=args.overlap_sec
+        chunk_duration_sec=args.chunk_sec, overlap_sec=args.overlap_sec,
+        use_vad=bool(args.vad),
     )
     transcriber = _select_transcriber(args)
     provisioner = None if args.mock else Provisioner(args.model_dir)
@@ -307,7 +309,7 @@ def cmd_analyze(args, out: IO, err: IO) -> int:
     transcriber = _select_transcriber(args)
     provisioner = None if args.mock else Provisioner(args.model_dir)
     stt_tier = "mock" if args.mock else args.tier
-    config = ChunkingConfig(chunk_duration_sec=args.chunk_sec, overlap_sec=args.overlap_sec)
+    config = ChunkingConfig(chunk_duration_sec=args.chunk_sec, overlap_sec=args.overlap_sec, use_vad=bool(args.vad))
 
     # Stage: decode (source setup: open/header/probe).
     t0 = time.perf_counter()
@@ -490,6 +492,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--mock", action="store_true", help="use MockTranscriber (no ML backend)")
         p.add_argument("--chunk-sec", type=float, default=30.0, help="chunk window seconds")
         p.add_argument("--overlap-sec", type=float, default=1.0, help="chunk overlap seconds")
+        p.add_argument("--vad", action="store_true",
+                       help="VAD-driven chunking: skip silence and split chunks at speech "
+                            "boundaries (faster on talky-with-gaps audio)")
         p.add_argument("--no-progress", action="store_true", help="suppress JSONL progress events")
         p.add_argument("--language", default=None, help="spoken language hint (Whisper backend)")
 
