@@ -432,6 +432,53 @@ def _persist_run(args, source, segments, stt_provenance, summarizer, summary, ll
         store.close()
 
 
+def cmd_vad(args, out: IO, err: IO) -> int:
+    """Run voice activity detection and emit the speech segments as JSON.
+
+    No model is required — VAD is pure NumPy over decoded PCM. Useful on its
+    own (find speech regions / silence) and as a building block for
+    transcribe-only-speech.
+    """
+    from localmind.vad import VadConfig, detect_speech
+
+    _emit_progress(err, {"stage": "vad", "fraction": 0.0})
+    try:
+        from localmind.audio.decode import decode_audio
+        decoded = decode_audio(args.audio)
+    except AudioError as exc:
+        raise CliError(str(exc)) from exc
+    cfg = VadConfig(
+        min_speech_sec=args.min_speech_sec,
+        min_silence_sec=args.min_silence_sec,
+        speech_rise_db=args.speech_rise_db,
+        speech_fall_db=args.speech_fall_db,
+    )
+    segments = detect_speech(decoded.samples, decoded.sample_rate, cfg)
+    _emit_progress(err, {"stage": "vad", "fraction": 1.0})
+
+    speech_total = sum(s.duration_sec for s in segments)
+    silence_total = max(0.0, decoded.duration_sec - speech_total)
+    _emit_json(out, {
+        "schema_version": CLI_OUTPUT_SCHEMA_VERSION,
+        "command": "vad",
+        "audio": {"path": args.audio, "duration_sec": decoded.duration_sec},
+        "config": {
+            "min_speech_sec": cfg.min_speech_sec,
+            "min_silence_sec": cfg.min_silence_sec,
+            "speech_rise_db": cfg.speech_rise_db,
+            "speech_fall_db": cfg.speech_fall_db,
+        },
+        "speech_segments": [
+            {"start": round(s.start_sec, 3), "end": round(s.end_sec, 3),
+             "duration_sec": round(s.duration_sec, 3)}
+            for s in segments
+        ],
+        "speech_total_sec": round(speech_total, 3),
+        "silence_total_sec": round(silence_total, 3),
+    })
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="localmind", description="LocalMind Audio CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -467,6 +514,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze.add_argument("--llm-tier", default="qwen2.5-7b", help="LLM model id (real backend)")
     p_analyze.add_argument("--store", default=None, help="persist artifacts to this SQLite store path")
     p_analyze.set_defaults(func=cmd_analyze)
+
+    p_vad = sub.add_parser("vad", help="detect speech segments (skip silence) — no model needed")
+    p_vad.add_argument("audio", help="path to a .wav/.m4a/.mp3/.aac audio file")
+    p_vad.add_argument("--min-speech-sec", type=float, default=0.25,
+                       help="drop speech bursts shorter than this (default 0.25)")
+    p_vad.add_argument("--min-silence-sec", type=float, default=0.30,
+                       help="merge speech separated by a gap shorter than this (default 0.30)")
+    p_vad.add_argument("--speech-rise-db", type=float, default=15.0,
+                       help="dB above noise floor to ENTER speech (default 15)")
+    p_vad.add_argument("--speech-fall-db", type=float, default=8.0,
+                       help="dB above noise floor to LEAVE speech (default 8)")
+    p_vad.add_argument("--no-progress", action="store_true", help="suppress JSONL progress events")
+    p_vad.set_defaults(func=cmd_vad)
 
     return parser
 

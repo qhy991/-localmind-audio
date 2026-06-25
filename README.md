@@ -99,6 +99,7 @@ and not a marketing claim.
 | CLI JSON/JSONL contract + progress/cancel | ✅ verified |
 | Offline model provisioning (SHA-256/size) | ✅ verified |
 | Per-stage metrics + real MLX GPU memory | ✅ verified |
+| Voice activity detection (energy VAD, skip silence) | ✅ verified (no model needed) |
 | Swift/SwiftUI native wrapper (M3) | 🚧 not yet (Python CLI is the stable contract) |
 
 The Python pipeline (M0–M2) is complete and tested. The optional native
@@ -267,7 +268,8 @@ fixed. Features are additive on top of it. Roughly ordered by impact:
 - Auto language detection + multi-language transcripts.
 
 **Pipeline features (currently deferred)**
-- VAD (voice activity detection) — skip silence, segment on speech.
+- ~~VAD (voice activity detection) — skip silence, segment on speech.~~ **✅ done**
+  (`localmind vad`; pure NumPy, no model).
 - Speaker diarization — "who said what."
 - Hot-words / custom vocabulary boost for domain terms.
 - Streaming / real-time incremental transcription.

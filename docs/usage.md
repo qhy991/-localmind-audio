@@ -5,7 +5,7 @@ see the [README](../README.md); for model setup see
 [provisioning](provisioning.md).
 
 After `pip install -e ".[ml]"` and `python scripts/provision_models.py`, the
-`localmind` command is available in your shell. Four subcommands:
+`localmind` command is available in your shell. Five subcommands:
 
 | Command | What it does | Output (stdout) |
 |---------|--------------|-----------------|
@@ -13,6 +13,7 @@ After `pip install -e ".[ml]"` and `python scripts/provision_models.py`, the
 | `localmind summarize` | transcript JSON → structured summary | `{summary, provenance}` or `summary_failed` |
 | `localmind analyze` | transcribe **+** summarize **+** persist in one pass | full run incl. metrics |
 | `localmind benchmark` | transcribe with per-stage timing + memory | benchmark report |
+| `localmind vad` | detect speech segments / skip silence — **no model needed** | `{audio, speech_segments[], speech_total, silence_total}` |
 
 Every command writes **versioned JSON to stdout** and **JSONL progress to
 stderr** (or nothing on stderr with `--no-progress`). Stdout is always a single
@@ -123,6 +124,45 @@ localmind benchmark audio.m4a \
 ```
 
 See [benchmark.md](benchmark.md) for the report schema.
+
+---
+
+## 5. VAD (voice activity detection)
+
+Find the spoken regions of an audio file — and how much is silence. **No model
+required**: VAD runs pure NumPy over decoded PCM, so it works with no
+provisioned weights and adds nothing to the zero-network footprint.
+
+```bash
+localmind vad meeting.m4a
+```
+
+**stdout:**
+
+```json
+{
+  "command": "vad",
+  "audio": {"path": "meeting.m4a", "duration_sec": 16.1},
+  "speech_segments": [
+    {"start": 1.07, "end": 7.27, "duration_sec": 6.2},
+    {"start": 9.65, "end": 11.39, "duration_sec": 1.74}
+  ],
+  "speech_total_sec": 11.89,
+  "silence_total_sec": 4.21
+}
+```
+
+Tune the detector with:
+
+- `--min-speech-sec` (default 0.25) — drop speech bursts shorter than this.
+- `--min-silence-sec` (default 0.30) — merge speech separated by a gap shorter
+  than this (a short pause inside one utterance shouldn't split it).
+- `--speech-rise-db` / `--speech-fall-db` (default 15 / 8) — hysteresis: how
+  many dB above the noise floor a frame must rise to *enter* / *leave* speech.
+
+Use cases: estimate how much of a long recording is actual talk before
+transcribing, locate the talk to skip dead air, or feed the speech intervals
+into downstream segmentation.
 
 ---
 
