@@ -132,7 +132,7 @@ pip install -e ".[ml]"
 python scripts/provision_models.py
 
 # 4. Run the full pipeline on an audio file (zero network from here on)
-python -m localmind.cli analyze path/to/meeting.m4a \
+localmind analyze path/to/meeting.m4a \
     --model-dir models --tier whisper-tiny --language zh \
     --llm-tier qwen3.5-0.8b --store localmind.db
 ```
@@ -147,24 +147,26 @@ newline-delimited JSON (JSONL).
 ## CLI
 
 All four subcommands emit **versioned JSON to stdout** and **JSONL progress to
-stderr**, so they compose cleanly in scripts and UIs.
+stderr**, so they compose cleanly in scripts and UIs. (After `pip install -e .`
+the `localmind` command is on your PATH.) For the full guide — flags, exit
+codes, recipes, piping — see **[docs/usage.md](docs/usage.md)**.
 
 ```bash
 # Transcribe only -> { audio, segments[], provenance }
-python -m localmind.cli transcribe audio.wav \
+localmind transcribe audio.wav \
     --model-dir models --tier whisper-tiny --language zh
 
 # Summarize an existing transcript JSON
-python -m localmind.cli summarize transcript.json \
+localmind summarize transcript.json \
     --model-dir models --llm-tier qwen3.5-0.8b
 
 # Transcribe + summarize + persist in one pass
-python -m localmind.cli analyze audio.m4a \
+localmind analyze audio.m4a \
     --model-dir models --tier whisper-tiny --language zh \
     --llm-tier qwen3.5-0.8b --store runs.db
 
 # Transcribe with per-stage timing + memory report (benchmark)
-python -m localmind.cli benchmark audio.m4a \
+localmind benchmark audio.m4a \
     --model-dir models --tier whisper-tiny --chunk-sec 30 --overlap-sec 2
 ```
 

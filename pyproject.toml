@@ -23,6 +23,11 @@ dev = [
     "imageio-ffmpeg>=0.5",  # provides a local ffmpeg binary for m4a/mp3 decode tests
 ]
 
+[project.scripts]
+# After `pip install -e .`, the `localmind` command is available directly:
+#   localmind transcribe audio.wav --model-dir models --tier whisper-tiny
+localmind = "localmind.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["localmind*"]
 
